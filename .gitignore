@@ -1,0 +1,90 @@
+# Credentials - NIEMALS committen!
+.env
+*.env
+.env.complete
+client_secret*.json
+credentials.json
+token.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Logs
+*.log
+sync_cron.log
+sync_monitored.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Data Files
+*.xlsx
+*.xls
+*.csv
+
+# n8n Workflows (alte Versionen)
+Aktien_Tommi*.json
+config.json
+
+# Old Documentation (nicht mehr relevant)
+ALTERNATIVE_*.md
+CREDENTIALS_*.md
+FINALE_*.md
+FIX_*.md
+GOOGLE_*.md
+IMPORT_*.md
+N8N_*.md
+PROJECT_*.md
+QUICK_*.md
+SCOPES_*.md
+SETUP_*.md
+START_*.md
+WORKFLOW_*.md
+
+# Test Scripts (alte Versionen)
+automation.py
+complete_sync*.py
+compare_*.txt
+configure_*.py
+create_minimal_workflow.py
+fix_*.py
+setup_*.py
+test_*.py
+
+# Claude AI Files
+.claude/

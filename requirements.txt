@@ -1,0 +1,12 @@
+# Python Dependencies für Excel → Notion Sync
+# Installation: pip3 install -r requirements.txt
+
+# HTTP Requests für Notion API & Dropbox Downloads
+requests>=2.31.0
+
+# Excel/Pandas für Excel-Datei Verarbeitung
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# Environment Variables (.env Datei)
+python-dotenv>=1.0.0
