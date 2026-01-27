@@ -7,7 +7,8 @@ Automatisiertes System zur Synchronisation von Excel-Daten mit Notion und Live-A
 **Version:** 2.0 (mit ISIN/WKN-Support)
 **Status:** ✅ Produktiv auf Hostinger VPS
 **Erstellt:** Januar 2026
-**Letzte Aktualisierung:** 27. Januar 2026
+**Letzte Aktualisierung:** 27. Januar 2026 (22:45 Uhr)
+**Deployment:** ✅ Vollständig (Blackfire + Passive Income)
 
 ---
 
