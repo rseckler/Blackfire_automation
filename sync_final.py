@@ -18,6 +18,24 @@ COLUMN_MAPPING = {
     'Company_Name': 'Name'
 }
 
+# Protected Properties - NEVER overwrite these (managed by other scripts)
+PROTECTED_PROPERTIES = {
+    # Stock prices (managed by stock_price_updater.py)
+    'Current_Price',
+    'Currency',
+    'Price_Change_Percent',
+    'Price_Update',
+    'Exchange',
+    'Market_Status',
+    'Day_High',
+    'Day_Low',
+    'Volume',
+    'Market_Cap',
+    # ISIN/WKN (managed by isin_wkn_updater.py)
+    'ISIN',
+    'WKN'
+}
+
 class SyncWithLogging:
     def __init__(self):
         self.dropbox_url = os.getenv('DROPBOX_URL')
@@ -243,7 +261,12 @@ class SyncWithLogging:
         for excel_col, value in excel_data.items():
             notion_col = self.map_column_name(excel_col)
 
+            # Skip properties that don't exist in Notion
             if notion_col not in self.valid_columns:
+                continue
+
+            # Skip protected properties (managed by stock_price_updater.py)
+            if notion_col in PROTECTED_PROPERTIES:
                 continue
 
             formatted = self.format_property_value(notion_col, value)

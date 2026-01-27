@@ -10,3 +10,6 @@ openpyxl>=3.1.0
 
 # Environment Variables (.env Datei)
 python-dotenv>=1.0.0
+
+# Stock Market Data (Yahoo Finance)
+yfinance>=0.2.40
