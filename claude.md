@@ -141,16 +141,22 @@ Success Rate: ~300-400 / ~1200-1300 skipped
 ```
 Daily Workflow (05:00 UTC):
 ┌─────────────────────────────────────────┐
-│ 1. Generate 10 ideas via GPT-4o         │
+│ 1. Load existing ideas from Notion      │
+│ 2. Generate 10 ideas via GPT-4o         │
 │    - Title, Description                 │
 │    - Implementation Guide (5 steps)     │
 │    - Difficulty, Start Capital          │
 │    - Tools, Potential Score (1-10)      │
-│ 2. Save to Notion Database              │
-│ 3. Send Email Summary                   │
+│ 3. Intelligent duplicate check          │
+│    - ChatGPT semantic analysis          │
+│    - Compares with existing ideas       │
+│    - Filters conceptually similar ideas │
+│ 4. Save unique ideas to Notion          │
+│ 5. Send Email Summary                   │
 └─────────────────────────────────────────┘
-Duration: ~50 seconds
+Duration: ~60-70 seconds
 Success Rate: 100%
+Duplicate Detection: Semantic (GPT-4o-mini)
 ```
 
 ---
@@ -324,6 +330,15 @@ git pull
 ---
 
 ## 🎉 Deployment Changelog
+
+### 28. Januar 2026 (04:25) - Intelligente Duplikatserkennung
+- ✅ ChatGPT-basierte semantische Duplikatserkennung implementiert
+- ✅ Erkennt konzeptionell ähnliche Ideen (nicht nur exakte Titel)
+- ✅ Nutzt GPT-4o-mini für Ähnlichkeitsanalyse
+- ✅ Test erfolgreich: 2 intelligente Duplikate erkannt und gefiltert
+- ✅ Detailliertes Logging mit Begründungen für gefilterte Duplikate
+- ✅ Fallback zu allen Ideen bei API-Fehler
+- 📊 Beispiele erkannt: "NFT Music Royalties" ≈ "Lizenzierung von Musik"
 
 ### 27. Januar 2026 (22:45) - Finale Production Version
 - ✅ Passive Income Generator auf VPS deployed
