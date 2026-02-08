@@ -7,6 +7,9 @@ Stock Price Updater v2 - Smart Ticker Validation
 """
 
 import os
+import sys
+import json
+import fcntl
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
@@ -15,6 +18,9 @@ import yfinance as yf
 from isin_ticker_mapper import HybridISINMapper
 
 load_dotenv()
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOCK_FILE = os.path.join(SCRIPT_DIR, '.stock_updater.lock')
 
 class StockPriceUpdater:
     def __init__(self):
@@ -41,12 +47,53 @@ class StockPriceUpdater:
             'error_message': None
         }
 
+        # Persistent blacklist file for invalid tickers
+        self.script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.blacklist_file = os.path.join(self.script_dir, 'invalid_tickers.json')
+
         # Cache for validated tickers (avoid re-checking)
         self.valid_tickers = set()
-        self.invalid_tickers = set()
+        self.invalid_tickers = self._load_blacklist()
 
         # ISIN mapper for intelligent lookup
         self.isin_mapper = HybridISINMapper()
+
+    def _load_blacklist(self):
+        """Load persistent invalid ticker blacklist from JSON file"""
+        try:
+            with open(self.blacklist_file, 'r') as f:
+                data = json.load(f)
+                # Blacklist entries older than 7 days get retried
+                cutoff = datetime.now().timestamp() - (7 * 86400)
+                valid = {k for k, v in data.items() if v > cutoff}
+                if len(valid) < len(data):
+                    print(f"   ♻️  {len(data) - len(valid)} blacklisted tickers expired, will retry")
+                return valid
+        except (FileNotFoundError, json.JSONDecodeError):
+            return set()
+
+    def _save_blacklist(self):
+        """Save invalid tickers to persistent JSON file"""
+        try:
+            # Merge with existing (in case another process updated it)
+            existing = {}
+            try:
+                with open(self.blacklist_file, 'r') as f:
+                    existing = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                pass
+
+            now = datetime.now().timestamp()
+            for ticker in self.invalid_tickers:
+                if ticker not in existing:
+                    existing[ticker] = now
+
+            with open(self.blacklist_file, 'w') as f:
+                json.dump(existing, f, indent=2)
+
+            print(f"   💾 Blacklist saved: {len(existing)} invalid tickers")
+        except Exception as e:
+            print(f"   ⚠️  Failed to save blacklist: {e}")
 
     def is_market_hours(self):
         """Check if current time is within market hours (7-23 Uhr)"""
@@ -465,8 +512,10 @@ class StockPriceUpdater:
 
         self.stats['stocks_processed'] = len(stocks)
 
+        blacklisted = sum(1 for s in stocks if s.get('symbol') and s['symbol'] in self.invalid_tickers)
         print(f"\n📊 Processing {len(stocks)} stocks...")
-        print("   ⏩ Invalid tickers will be skipped automatically")
+        print(f"   ⏩ {blacklisted} known-invalid tickers will be skipped (blacklist)")
+        print(f"   ⏩ Remaining tickers will be validated")
 
         # Process each stock
         updated_count = 0
@@ -514,6 +563,9 @@ class StockPriceUpdater:
 
         self.stats['success'] = True
         self.stats['end_time'] = datetime.now()
+
+        # Save blacklist for next run
+        self._save_blacklist()
 
         print("\n" + "="*70)
         print("✅ UPDATE COMPLETE!")
@@ -651,7 +703,25 @@ class StockPriceUpdater:
 
 
 if __name__ == "__main__":
-    updater = StockPriceUpdater()
-    success = updater.run()
+    # Prevent concurrent runs
+    lock_fd = open(LOCK_FILE, 'w')
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("⚠️  Another stock_price_updater instance is already running. Exiting.")
+        sys.exit(0)
 
-    exit(0 if success else 1)
+    lock_fd.write(str(os.getpid()))
+    lock_fd.flush()
+
+    try:
+        updater = StockPriceUpdater()
+        success = updater.run()
+        sys.exit(0 if success else 1)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+        try:
+            os.remove(LOCK_FILE)
+        except OSError:
+            pass

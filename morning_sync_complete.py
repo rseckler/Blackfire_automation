@@ -7,7 +7,10 @@ Complete Morning Sync
 
 import subprocess
 import sys
+import os
 from datetime import datetime
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 print("=" * 70)
 print("🌅 MORNING SYNC - COMPLETE")
@@ -18,7 +21,7 @@ print("=" * 70)
 print("\n📊 Step 1: Excel → Notion Sync...")
 print("-" * 70)
 result1 = subprocess.run(
-    [sys.executable, 'sync_final.py'],
+    [sys.executable, os.path.join(SCRIPT_DIR, 'sync_final.py')],
     capture_output=False
 )
 
@@ -31,7 +34,7 @@ print("\n" + "=" * 70)
 print("🔍 Step 2: ISIN/WKN Research...")
 print("-" * 70)
 result2 = subprocess.run(
-    [sys.executable, 'isin_wkn_updater.py'],
+    [sys.executable, os.path.join(SCRIPT_DIR, 'isin_wkn_updater.py')],
     capture_output=False
 )
 

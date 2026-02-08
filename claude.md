@@ -1,8 +1,8 @@
 # Blackfire Automation - Finale Systemdokumentation
 
-**Status:** ✅ Production Ready - Deployed auf Hostinger VPS  
-**Datum:** 27. Januar 2026 (22:45 Uhr)  
-**Version:** 2.0 (mit ISIN/WKN-Support + Passive Income Integration)
+**Status:** ✅ Production Ready - Deployed auf Hostinger VPS
+**Datum:** 8. Februar 2026
+**Version:** 2.1 (Reliability Fixes: Retry-Logik, Blacklist, Log-Rotation, PID-Lock)
 
 ---
 
@@ -275,7 +275,7 @@ ps aux | grep python3
 |--------|----------|
 | Passive Income Generator | ~50 seconds |
 | Blackfire Morning Sync | 6-8 minutes |
-| Blackfire Stock Update | 20-30 minutes |
+| Blackfire Stock Update | ~20 minutes (with blacklist), ~54 min without |
 
 ---
 
@@ -331,6 +331,16 @@ git pull
 
 ## 🎉 Deployment Changelog
 
+### 8. Februar 2026 - Reliability & Performance Fixes
+- ✅ **Pfad-Fix:** `morning_sync_complete.py` nutzt `os.path.join(SCRIPT_DIR, ...)` statt relativer Pfade (war 12 Tage kaputt)
+- ✅ **Persistent Invalid-Ticker Blacklist:** `invalid_tickers.json` speichert bekannte ungültige Ticker, TTL 7 Tage → Runtime ~54 Min → ~20 Min
+- ✅ **Retry-Logik:** `sync_final.py` hat `_notion_request()` mit Retry bei 429/5xx, Exponential Backoff, `requests.Session()` für Connection-Pooling
+- ✅ **Rate-Limiting:** `time.sleep(0.35)` zwischen Notion API Calls in `sync_final.py` (bleibt unter 3 req/sec)
+- ✅ **Timeout erhöht:** Notion API Timeout 30s → 120s in `sync_final.py`
+- ✅ **Concurrent-Run-Schutz:** `stock_price_updater.py` nutzt `fcntl.flock()` PID-Lock, verhindert parallele Runs
+- ✅ **Log-Rotation:** logrotate auf VPS konfiguriert (stock_prices.log daily/5MB, sync_cron.log + cron.log weekly)
+- ✅ **Monitoring:** Service Overview Dashboard (http://72.62.148.205:3002) zeigt Health-Status aller Services
+
 ### 28. Januar 2026 (04:25) - Intelligente Duplikatserkennung
 - ✅ ChatGPT-basierte semantische Duplikatserkennung implementiert
 - ✅ Erkennt konzeptionell ähnliche Ideen (nicht nur exakte Titel)
@@ -377,12 +387,17 @@ git pull
 - [x] Mac Cronjobs entfernt
 - [x] Dokumentation vollständig
 - [x] Test-Runs erfolgreich
+- [x] Log-Rotation konfiguriert
+- [x] PID-Lock für Stock-Updater
+- [x] Retry-Logik für Notion API
+- [x] Invalid-Ticker Blacklist
+- [x] Service Overview Dashboard deployed
 
 **Status:** 🟢 All Systems Operational
 
 ---
 
-**Erstellt mit Claude Code** 🤖  
-**Deployment:** GitHub → Hostinger VPS  
-**Maintenance:** Git Pull für Updates  
-**Monitoring:** Logs + Notion Sync History
+**Erstellt mit Claude Code** 🤖
+**Deployment:** GitHub → Hostinger VPS
+**Maintenance:** Git Pull für Updates
+**Monitoring:** Service Overview Dashboard (http://72.62.148.205:3002) + Notion Sync History

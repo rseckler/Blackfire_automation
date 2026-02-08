@@ -49,6 +49,10 @@ class SyncWithLogging:
             'Content-Type': 'application/json'
         }
 
+        # Reuse TCP connections for all Notion API calls
+        self.session = requests.Session()
+        self.session.headers.update(self.notion_headers)
+
         self.property_types = {}
         self.valid_columns = set()
 
@@ -66,15 +70,47 @@ class SyncWithLogging:
             'error_message': None
         }
 
+    def _notion_request(self, method, url, max_retries=3, **kwargs):
+        """Make a Notion API request with retry on 429/5xx and rate limiting"""
+        kwargs.setdefault('timeout', 120)
+
+        for attempt in range(max_retries):
+            try:
+                response = getattr(self.session, method)(url, **kwargs)
+
+                if response.status_code == 429:
+                    retry_after = int(response.headers.get('Retry-After', 2))
+                    wait = retry_after * (attempt + 1)
+                    print(f"   ⏳ Rate limited, waiting {wait}s...")
+                    time.sleep(wait)
+                    continue
+
+                if response.status_code >= 500:
+                    wait = 2 ** (attempt + 1)
+                    print(f"   ⏳ Server error {response.status_code}, retry in {wait}s...")
+                    time.sleep(wait)
+                    continue
+
+                return response
+
+            except requests.exceptions.Timeout:
+                if attempt < max_retries - 1:
+                    wait = 5 * (attempt + 1)
+                    print(f"   ⏳ Timeout, retry in {wait}s...")
+                    time.sleep(wait)
+                    continue
+                raise
+
+        return response
+
     def get_database_schema(self):
         """Get database schema"""
         print("🔍 Getting database schema...")
 
         try:
-            response = requests.get(
-                f'https://api.notion.com/v1/databases/{self.notion_db_id}',
-                headers=self.notion_headers,
-                timeout=30
+            response = self._notion_request(
+                'get',
+                f'https://api.notion.com/v1/databases/{self.notion_db_id}'
             )
 
             if response.status_code == 200:
@@ -141,11 +177,10 @@ class SyncWithLogging:
                 if start_cursor:
                     body['start_cursor'] = start_cursor
 
-                response = requests.post(
+                response = self._notion_request(
+                    'post',
                     f'https://api.notion.com/v1/databases/{self.notion_db_id}/query',
-                    headers=self.notion_headers,
-                    json=body,
-                    timeout=30
+                    json=body
                 )
 
                 if response.status_code == 200:
@@ -289,12 +324,14 @@ class SyncWithLogging:
 
             properties = self.build_notion_properties(data)
 
+            # Rate limiting: stay under 3 req/sec
+            time.sleep(0.35)
+
             try:
-                response = requests.patch(
+                response = self._notion_request(
+                    'patch',
                     f'https://api.notion.com/v1/pages/{page_id}',
-                    headers=self.notion_headers,
-                    json={'properties': properties},
-                    timeout=30
+                    json={'properties': properties}
                 )
 
                 if response.status_code == 200:
@@ -326,15 +363,16 @@ class SyncWithLogging:
         for data in creates:
             properties = self.build_notion_properties(data)
 
+            time.sleep(0.35)
+
             try:
-                response = requests.post(
+                response = self._notion_request(
+                    'post',
                     'https://api.notion.com/v1/pages',
-                    headers=self.notion_headers,
                     json={
                         'parent': {'database_id': self.notion_db_id},
                         'properties': properties
-                    },
-                    timeout=30
+                    }
                 )
 
                 if response.status_code == 200:
@@ -435,11 +473,10 @@ class SyncWithLogging:
             }
 
         try:
-            response = requests.post(
+            response = self._notion_request(
+                'post',
                 'https://api.notion.com/v1/pages',
-                headers=self.notion_headers,
-                json=log_entry,
-                timeout=30
+                json=log_entry
             )
 
             if response.status_code == 200:
