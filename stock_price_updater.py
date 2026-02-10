@@ -47,33 +47,36 @@ class StockPriceUpdater:
             'error_message': None
         }
 
-        # Persistent blacklist file for invalid tickers
+        # Persistent blacklist file for pages where ALL validation failed
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
-        self.blacklist_file = os.path.join(self.script_dir, 'invalid_tickers.json')
+        self.blacklist_file = os.path.join(self.script_dir, 'invalid_pages.json')
 
-        # Cache for validated tickers (avoid re-checking)
+        # Page-level blacklist: pages where symbol + ISIN + WKN all failed
+        self.blacklisted_pages = self._load_blacklist()
+
+        # In-memory caches for within-run dedup (not persisted)
         self.valid_tickers = set()
-        self.invalid_tickers = self._load_blacklist()
+        self.invalid_tickers = set()
 
         # ISIN mapper for intelligent lookup
         self.isin_mapper = HybridISINMapper()
 
     def _load_blacklist(self):
-        """Load persistent invalid ticker blacklist from JSON file"""
+        """Load persistent blacklist of page IDs from JSON file"""
         try:
             with open(self.blacklist_file, 'r') as f:
                 data = json.load(f)
-                # Blacklist entries older than 7 days get retried
-                cutoff = datetime.now().timestamp() - (7 * 86400)
+                # Blacklist entries older than 30 days get retried
+                cutoff = datetime.now().timestamp() - (30 * 86400)
                 valid = {k for k, v in data.items() if v > cutoff}
                 if len(valid) < len(data):
-                    print(f"   ♻️  {len(data) - len(valid)} blacklisted tickers expired, will retry")
+                    print(f"   ♻️  {len(data) - len(valid)} blacklisted pages expired, will retry")
                 return valid
         except (FileNotFoundError, json.JSONDecodeError):
             return set()
 
     def _save_blacklist(self):
-        """Save invalid tickers to persistent JSON file"""
+        """Save blacklisted page IDs to persistent JSON file"""
         try:
             # Merge with existing (in case another process updated it)
             existing = {}
@@ -84,14 +87,18 @@ class StockPriceUpdater:
                 pass
 
             now = datetime.now().timestamp()
-            for ticker in self.invalid_tickers:
-                if ticker not in existing:
-                    existing[ticker] = now
+            for page_id in self.blacklisted_pages:
+                if page_id not in existing:
+                    existing[page_id] = now
+
+            # Prune expired entries
+            cutoff = datetime.now().timestamp() - (30 * 86400)
+            existing = {k: v for k, v in existing.items() if v > cutoff}
 
             with open(self.blacklist_file, 'w') as f:
                 json.dump(existing, f, indent=2)
 
-            print(f"   💾 Blacklist saved: {len(existing)} invalid tickers")
+            print(f"   💾 Blacklist saved: {len(existing)} invalid pages")
         except Exception as e:
             print(f"   ⚠️  Failed to save blacklist: {e}")
 
@@ -512,14 +519,15 @@ class StockPriceUpdater:
 
         self.stats['stocks_processed'] = len(stocks)
 
-        blacklisted = sum(1 for s in stocks if s.get('symbol') and s['symbol'] in self.invalid_tickers)
+        blacklisted = sum(1 for s in stocks if s['page_id'] in self.blacklisted_pages)
         print(f"\n📊 Processing {len(stocks)} stocks...")
-        print(f"   ⏩ {blacklisted} known-invalid tickers will be skipped (blacklist)")
-        print(f"   ⏩ Remaining tickers will be validated")
+        print(f"   ⏩ {blacklisted} known-invalid pages will be skipped (blacklist)")
+        print(f"   ⏩ {len(stocks) - blacklisted} stocks to validate")
 
         # Process each stock
         updated_count = 0
         skipped_count = 0
+        api_calls_made = False
 
         for i, stock in enumerate(stocks):
             symbol = stock.get('symbol')
@@ -528,15 +536,23 @@ class StockPriceUpdater:
             isin = stock.get('isin')
             wkn = stock.get('wkn')
 
-            # Rate limiting: 1 second between calls
-            if i > 0:
+            # Skip blacklisted pages immediately (no sleep, no API calls)
+            if page_id in self.blacklisted_pages:
+                skipped_count += 1
+                self.stats['skipped_tickers'].append(original or isin or wkn or 'Unknown')
+                continue
+
+            # Rate limiting: only sleep before actual API calls
+            if api_calls_made:
                 time.sleep(1)
 
             # Validate ticker (tries Symbol, then ISIN, then WKN)
+            api_calls_made = True
             valid_symbol = self.validate_ticker(symbol=symbol, isin=isin, wkn=wkn)
             if not valid_symbol:
                 skipped_count += 1
                 self.stats['skipped_tickers'].append(original or isin or wkn or 'Unknown')
+                self.blacklisted_pages.add(page_id)
                 continue
 
             # Fetch price (using validated symbol)
