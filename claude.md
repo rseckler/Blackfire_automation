@@ -309,6 +309,10 @@ git pull
 - `.env` aktualisiert: Supabase statt Notion Credentials
 - Notion-Abhängigkeit vollständig entfernt
 - Performance: Morning Sync von 6-8 Min auf ~70 Sek (kein Rate-Limiting mehr)
+- VPS Deployment: git pull, pip install, .env mit Supabase-Credentials
+- VPS Tests erfolgreich: test_complete_system.py + stock_price_updater.py
+- Alte Notion-Backup-Dateien aufgeräumt (18 lokal, 11 auf VPS)
+- `test_complete_system.py` für Supabase aktualisiert
 
 ### 8. Februar 2026 - Reliability & Performance Fixes (v2.1)
 - Persistent Invalid-Ticker Blacklist
@@ -333,14 +337,17 @@ git pull
 - [x] sync_history Tabelle erstellt
 - [x] supabase_helper.py mit Retry + Pagination
 - [x] sync_final.py getestet (977 Updates)
-- [x] stock_price_updater.py getestet (221+ Kurse)
+- [x] stock_price_updater.py getestet (221+ Kurse lokal, VPS verifiziert)
 - [x] isin_wkn_updater.py getestet (199 ISINs)
-- [x] Credentials konfiguriert (.env)
+- [x] Credentials konfiguriert (.env lokal + VPS)
 - [x] Cronjobs (gleiche Skript-Namen, keine Änderung nötig)
 - [x] PID-Lock für Stock-Updater
 - [x] Invalid-Companies Blacklist (30d TTL)
 - [x] Log-Rotation konfiguriert
 - [x] Service Overview Dashboard
-- [ ] VPS Deployment (git pull + pip install)
+- [x] VPS Deployment (git pull + pip install + .env)
+- [x] VPS Test: test_complete_system.py (3/10 Stocks erfolgreich)
+- [x] VPS Test: stock_price_updater.py (Full Run verifiziert)
+- [x] Alte Notion-Backup-Dateien aufgeräumt (lokal + VPS)
 
-**Status:** All Systems Operational (lokal getestet, VPS-Deployment ausstehend)
+**Status:** All Systems Operational - VPS Production Deployed
