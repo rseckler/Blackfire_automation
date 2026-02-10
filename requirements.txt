@@ -1,7 +1,7 @@
-# Python Dependencies für Excel → Notion Sync
+# Python Dependencies für Excel → Supabase Sync
 # Installation: pip3 install -r requirements.txt
 
-# HTTP Requests für Notion API & Dropbox Downloads
+# HTTP Requests für API-Aufrufe & Dropbox Downloads
 requests>=2.31.0
 
 # Excel/Pandas für Excel-Datei Verarbeitung
@@ -13,3 +13,6 @@ python-dotenv>=1.0.0
 
 # Stock Market Data (Yahoo Finance)
 yfinance>=0.2.40
+
+# Supabase (PostgreSQL)
+supabase>=2.0.0

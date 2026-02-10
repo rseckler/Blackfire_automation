@@ -1,12 +1,12 @@
-# Blackfire Automation - Finale Systemdokumentation
+# Blackfire Automation - Systemdokumentation
 
-**Status:** ✅ Production Ready - Deployed auf Hostinger VPS
-**Datum:** 8. Februar 2026
-**Version:** 2.1 (Reliability Fixes: Retry-Logik, Blacklist, Log-Rotation, PID-Lock)
+**Status:** Production Ready - Deployed auf Hostinger VPS
+**Datum:** 10. Februar 2026
+**Version:** 3.0 (Migration Notion -> Supabase)
 
 ---
 
-## 🎯 Übersicht
+## Übersicht
 
 3 automatisierte Workflows laufen 24/7 auf Hostinger VPS:
 
@@ -15,55 +15,104 @@
 - **Path:** `/root/Passive-Income-Generator`
 - **Funktion:** Generiert täglich 10 Passive Income Ideen via GPT-4o
 - **Output:** Notion Database + E-Mail
-- **Status:** ✅ Getestet & Funktioniert
+- **Status:** Aktiv
 
 ### 2. Blackfire Morning Sync (07:00 MEZ)
 - **Repo:** https://github.com/rseckler/Blackfire_automation
 - **Path:** `/root/Blackfire_automation`
-- **Funktion:** Excel → Notion Sync (~900 Aktien) + ISIN/WKN Recherche
-- **Status:** ✅ Aktiv
+- **Funktion:** Excel -> Supabase Sync (~977 Aktien) + ISIN/WKN Recherche
+- **Status:** Aktiv
 
 ### 3. Blackfire Stock Updates (08:00-00:00 MEZ, stündlich)
 - **Repo:** https://github.com/rseckler/Blackfire_automation
 - **Path:** `/root/Blackfire_automation`
-- **Funktion:** Live Aktienkurse (~300-400 Updates/h)
-- **Status:** ✅ Aktiv
+- **Funktion:** Live Aktienkurse via yfinance -> Supabase (~300-400 Updates/h)
+- **Status:** Aktiv
 
 ---
 
-## 🚀 VPS Production Environment
+## Datenbank: Supabase (PostgreSQL)
 
-**Server:** 72.62.148.205 (Hostinger)  
-**OS:** Ubuntu 24.04.3 LTS  
-**Python:** 3.12.3 (separate venvs pro Projekt)  
-**SSH:** Key-based Authentication (kein Password)  
-**User:** root  
+**URL:** https://lglvuiuwbrhiqvxcriwa.supabase.co
+**Dashboard:** https://supabase.com/dashboard/project/lglvuiuwbrhiqvxcriwa
+
+### Tabellen
+
+| Tabelle | Zweck |
+|---------|-------|
+| `companies` | Haupttabelle (~1644 Aktien), Core-Felder + `extra_data` JSONB |
+| `sync_history` | Automatisches Logging aller Sync/Update-Runs |
+| `stock_prices` | Historische Kursdaten (von Blackfire_service) |
+
+### Companies Schema (relevante Felder)
+
+```
+id UUID (PK)
+name TEXT
+symbol TEXT (UNIQUE)
+satellog TEXT (UNIQUE) -- Excel-Identifier
+wkn TEXT
+isin TEXT
+current_price DECIMAL(20,4)
+price_change_percent DECIMAL(10,4)
+price_update TIMESTAMPTZ
+market_status TEXT
+day_high DECIMAL(20,4)
+day_low DECIMAL(20,4)
+volume BIGINT
+market_cap BIGINT
+exchange TEXT
+currency TEXT
+extra_data JSONB -- alle weiteren Excel-Spalten
+last_synced_at TIMESTAMPTZ
+```
+
+### Shared Module: `supabase_helper.py`
+
+Alle Scripts nutzen dieses Modul für Supabase-Zugriff:
+- `get_client()` - Singleton Supabase Client
+- `get_all_companies(select)` - Paginierter Abruf (1000er Batches)
+- `update_company(id, data)` - Update mit Retry (3 Versuche)
+- `insert_companies(list)` - Batch Insert mit Retry
+- `log_sync_history(stats)` - Sync-Log in `sync_history` Tabelle
+
+---
+
+## VPS Production Environment
+
+**Server:** 72.62.148.205 (Hostinger)
+**OS:** Ubuntu 24.04.3 LTS
+**Python:** 3.12.3 (separate venvs pro Projekt)
+**SSH:** Key-based Authentication (kein Password)
+**User:** root
 
 ### Projektstruktur
 
 ```
 /root/
-├── Blackfire_automation/          # Stock & Excel Automation
-│   ├── venv/                      # Python 3.12.3
-│   ├── .env                       # Credentials (chmod 600)
-│   ├── sync_final.py
-│   ├── morning_sync_complete.py
-│   ├── stock_price_updater.py
-│   ├── isin_wkn_updater.py
-│   ├── isin_ticker_mapper.py
-│   ├── sync_cron.log             # Morning Sync Logs
-│   └── stock_prices.log          # Stock Update Logs
+├── Blackfire_automation/
+│   ├── venv/
+│   ├── .env                       # Supabase + Dropbox Credentials
+│   ├── supabase_helper.py         # Shared Supabase Client
+│   ├── sync_final.py              # Excel -> Supabase Sync
+│   ├── morning_sync_complete.py   # Orchestrator (sync + ISIN)
+│   ├── stock_price_updater.py     # Stündliche Kursupdates
+│   ├── isin_wkn_updater.py        # ISIN/WKN Recherche
+│   ├── isin_ticker_mapper.py      # Hybrid ISIN->Ticker (OpenFIGI + ChatGPT)
+│   ├── invalid_companies.json     # Blacklist (Supabase UUIDs, TTL 30d)
+│   ├── sync_cron.log
+│   └── stock_prices.log
 │
-└── Passive-Income-Generator/      # Daily Ideas Generator
-    ├── venv/                      # Python 3.12.3
-    ├── .env                       # Credentials (chmod 600)
+└── Passive-Income-Generator/
+    ├── venv/
+    ├── .env
     ├── passive_income_generator.py
-    └── cron.log                   # Generator Logs
+    └── cron.log
 ```
 
 ---
 
-## ⏰ Cronjob Schedule (VPS)
+## Cronjob Schedule (VPS)
 
 ```cron
 # Passive Income Generator (05:00 UTC = 06:00 MEZ)
@@ -76,112 +125,89 @@
 0 7-23 * * * /root/Blackfire_automation/venv/bin/python3 /root/Blackfire_automation/stock_price_updater.py >> /root/Blackfire_automation/stock_prices.log 2>&1
 ```
 
-**Mac:** ❌ Alle Cronjobs entfernt (keine lokalen Jobs mehr)
+---
+
+## Credentials
+
+### .env (Blackfire_automation)
+
+```bash
+# Supabase (PostgreSQL)
+SUPABASE_URL=https://lglvuiuwbrhiqvxcriwa.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=...  # Service Role Key aus Supabase Dashboard
+
+# Dropbox
+DROPBOX_URL=...  # Direct Download Link (?dl=1)
+
+# Optional
+BRAVE_API_KEY=...
+```
+
+Notion-Credentials werden nicht mehr benötigt (Migration abgeschlossen).
 
 ---
 
-## 🔑 Credentials & Notion Integration
+## Systemarchitektur
 
-### Notion API
-- **API Key:** In `.env` auf VPS (nicht in Git!)
-- **Gültig für:** Beide Projekte (Blackfire + Passive Income)
-- **Letzte Aktualisierung:** 27. Januar 2026
-
-### Notion Databases
-
-| Database | ID | Integration |
-|----------|-----|-------------|
-| **Aktien_Blackfire** | `2f3708a3-de95-807b-88c4-ca0463fd07fb` | ✅ Verbunden |
-| **Sync History** | `2f4708a3-de95-81f2-b551-f06244e000e9` | ✅ Verbunden (404 fixed!) |
-| **Passive Income Ideen** | `2f5708a3-de95-8180-b6a7-dd163de77ea8` | ✅ Verbunden |
-
-**Wichtig:** Sync History 404-Problem wurde behoben durch Verbindung der Integration!
-
-### OpenAI API
-- **Verwendet von:** Passive Income Generator (GPT-4o)
-- **Kosten:** ~$0.10-0.15 pro Tag = ~$4/Monat
-
----
-
-## 📊 Systemarchitektur
-
-### Blackfire Automation
+### Morning Sync (06:00 UTC)
 
 ```
-Morning Workflow (06:00 UTC):
-┌─────────────────────────────────────────┐
-│ 1. Dropbox → Excel Download (3.7 MB)   │
-│ 2. Parse 1610 rows                      │
-│ 3. Compare with Notion                  │
-│ 4. Update ~900 pages (Skip Protected!)  │
-│ 5. Create ~2-3 new pages                │
-│ 6. ISIN/WKN Research (new ISINs)        │
-│ 7. Log to Sync History                  │
-└─────────────────────────────────────────┘
-Duration: 6-8 minutes
-
-Stock Price Update (07-23 UTC, hourly):
-┌─────────────────────────────────────────┐
-│ 1. Query all stocks (~1600)             │
-│ 2. Validate ticker (4-tier strategy)    │
-│    - Try Symbol (US)                    │
-│    - Try Symbol.DE (German)             │
-│    - Map ISIN → Ticker (OpenFIGI)       │
-│    - Map WKN → Ticker                   │
-│ 3. Fetch prices via yfinance            │
-│ 4. Update 10 stock properties           │
-│ 5. Log to Sync History                  │
-└─────────────────────────────────────────┘
-Duration: 20-30 minutes
-Success Rate: ~300-400 / ~1200-1300 skipped
+┌──────────────────────────────────────────┐
+│ 1. Dropbox -> Excel Download (3.8 MB)    │
+│ 2. Parse ~1672 rows, 85 columns          │
+│ 3. Get existing companies from Supabase  │
+│ 4. Match by satellog, then by name       │
+│ 5. Update ~977 companies                 │
+│    - Core fields -> direkte Spalten      │
+│    - Rest -> extra_data JSONB            │
+│    - Skip Protected Fields!              │
+│ 6. Create new companies                  │
+│ 7. ISIN/WKN Research (new symbols)       │
+│ 8. Log to sync_history                   │
+└──────────────────────────────────────────┘
+Duration: ~70 seconds
 ```
 
-### Passive Income Generator
+### Stock Price Update (07-23 UTC, hourly)
 
 ```
-Daily Workflow (05:00 UTC):
-┌─────────────────────────────────────────┐
-│ 1. Load existing ideas from Notion      │
-│ 2. Generate 10 ideas via GPT-4o         │
-│    - Title, Description                 │
-│    - Implementation Guide (5 steps)     │
-│    - Difficulty, Start Capital          │
-│    - Tools, Potential Score (1-10)      │
-│ 3. Intelligent duplicate check          │
-│    - ChatGPT semantic analysis          │
-│    - Compares with existing ideas       │
-│    - Filters conceptually similar ideas │
-│ 4. Save unique ideas to Notion          │
-│ 5. Send Email Summary                   │
-└─────────────────────────────────────────┘
-Duration: ~60-70 seconds
-Success Rate: 100%
-Duplicate Detection: Semantic (GPT-4o-mini)
+┌──────────────────────────────────────────┐
+│ 1. Get all companies from Supabase       │
+│ 2. Skip blacklisted companies            │
+│ 3. Validate ticker (4-tier strategy)     │
+│    - Try Symbol (US)                     │
+│    - Try Symbol.DE (German)              │
+│    - Map ISIN -> Ticker (OpenFIGI)       │
+│    - Map WKN -> Ticker                   │
+│ 4. Fetch prices via yfinance             │
+│ 5. Update Supabase directly              │
+│ 6. Save blacklist for next run           │
+│ 7. Log to sync_history                   │
+└──────────────────────────────────────────┘
+Duration: ~20 minutes (with blacklist)
+Success Rate: ~300-400 updated / ~1200 skipped
 ```
 
 ---
 
-## 🔧 Protected Properties (Blackfire)
+## Protected Properties
 
-**Kritisch:** `sync_final.py` überschreibt diese Properties NIEMALS:
+`sync_final.py` überschreibt diese Felder NIEMALS:
 
 ```python
 PROTECTED_PROPERTIES = {
     # Stock prices (managed by stock_price_updater.py)
-    'Current_Price', 'Currency', 'Price_Change_Percent', 
+    'Current_Price', 'Currency', 'Price_Change_Percent',
     'Price_Update', 'Exchange', 'Market_Status',
     'Day_High', 'Day_Low', 'Volume', 'Market_Cap',
-    
     # Identifiers (managed by isin_wkn_updater.py)
     'ISIN', 'WKN'
 }
 ```
 
-Dies verhindert, dass der Excel-Sync die stündlich aktualisierten Kursdaten überschreibt!
-
 ---
 
-## 🛠️ Management & Updates
+## Management & Updates
 
 ### SSH Zugriff
 ```bash
@@ -190,214 +216,131 @@ ssh root@72.62.148.205
 
 ### Logs ansehen
 ```bash
-# Passive Income
-tail -f ~/Passive-Income-Generator/cron.log
-
-# Blackfire Morning Sync
 tail -f ~/Blackfire_automation/sync_cron.log
-
-# Blackfire Stock Updates
 tail -f ~/Blackfire_automation/stock_prices.log
-
-# Alle Logs gleichzeitig
-tail -f ~/*/*.log
+tail -f ~/Passive-Income-Generator/cron.log
 ```
 
 ### Code Updates deployen
 ```bash
-# Auf Mac: Entwickeln & Pushen
-cd ~/Documents/4_AI/[Projekt]
-# Code ändern...
-git add .
-git commit -m "Update XYZ"
-git push origin main
+# Lokal: pushen
+git add . && git commit -m "Update XYZ" && git push
 
-# Auf VPS: Updates holen
+# VPS: pullen + Dependencies
 ssh root@72.62.148.205
-cd ~/[Projekt]
+cd ~/Blackfire_automation
 git pull
-
-# Fertig! Cronjob nutzt automatisch neuen Code
+source venv/bin/activate
+pip3 install -r requirements.txt  # nur bei neuen Dependencies
 ```
 
 ### Manuell testen
 ```bash
-# Passive Income
-cd ~/Passive-Income-Generator
-source venv/bin/activate
-python3 passive_income_generator.py
-
-# Blackfire
 cd ~/Blackfire_automation
 source venv/bin/activate
-python3 test_complete_system.py        # Safe test (10 stocks)
-python3 morning_sync_complete.py       # Full morning sync
-python3 stock_price_updater.py         # Stock updates (only 7-23)
-```
-
-### System Status
-```bash
-# Cronjobs prüfen
-crontab -l
-
-# Disk Space
-df -h
-
-# RAM
-free -h
-
-# Python Prozesse
-ps aux | grep python3
+python3 sync_final.py              # Excel -> Supabase
+python3 stock_price_updater.py     # Kurse updaten (nur 7-23 Uhr)
+python3 isin_wkn_updater.py        # ISIN/WKN recherchieren
+python3 morning_sync_complete.py   # Vollständiger Morning Sync
 ```
 
 ---
 
-## 💰 Kosten & Performance
+## Kosten & Performance
 
 ### Monthly Costs
 | Service | Cost |
 |---------|------|
 | Hostinger VPS | Already paid |
-| Notion API | $0 (Free Tier) |
+| Supabase | $0 (Free Tier) |
 | yfinance | $0 |
 | OpenFIGI | $0 (Free Tier) |
 | OpenAI (GPT-4o) | ~$4 |
 | **Total** | **~$4/month** |
 
 ### API Limits
-- **Notion:** 3 req/sec → ~2000 req/day ✅
-- **yfinance:** Unlimited → ~1600 calls/hour ✅
-- **OpenFIGI:** 10 req/min → ~30 req/day ✅
-- **OpenAI:** Pay-as-you-go → 1 call/day ✅
+- **Supabase:** Kein Rate-Limit (Service Role Key)
+- **yfinance:** Unlimited
+- **OpenFIGI:** 10 req/min
+- **OpenAI:** Pay-as-you-go
 
 ### Performance
 | Script | Duration |
 |--------|----------|
 | Passive Income Generator | ~50 seconds |
-| Blackfire Morning Sync | 6-8 minutes |
-| Blackfire Stock Update | ~20 minutes (with blacklist), ~54 min without |
+| Blackfire Morning Sync (Excel -> Supabase) | ~70 seconds |
+| Blackfire Stock Update | ~20 minutes (with blacklist) |
 
 ---
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
 ### Problem: Cronjob läuft nicht
 ```bash
-# Manuell testen
-cd ~/[Projekt]
+cd ~/Blackfire_automation
 source venv/bin/activate
 python3 [script].py
-
-# Cron Service prüfen
 systemctl status cron
-
-# Cronjob Logs (System)
 grep CRON /var/log/syslog | grep Blackfire | tail -20
 ```
 
-### Problem: Notion API 404
-**Gelöst!** Integration wurde mit Sync History verbunden.
-
-Falls erneut:
-1. Notion öffnen → Database öffnen
-2. ⋮ (Menü) → Connections → Add Integration
-3. Integration auswählen
+### Problem: Supabase Connection Error
+- `.env` prüfen: `SUPABASE_URL` und `SUPABASE_SERVICE_ROLE_KEY`
+- Service Role Key im Supabase Dashboard -> Project Settings -> API
 
 ### Problem: Git Pull Conflicts
 ```bash
-# GitHub-Version übernehmen (empfohlen)
 git reset --hard origin/main
 git pull
 ```
 
 ---
 
-## 📚 Dokumentation
+## Deployment Changelog
 
-### Blackfire Automation
-- **GitHub:** https://github.com/rseckler/Blackfire_automation
-- **README.md** - Projekt-Übersicht
-- **SYSTEMDOKU.md** - Diese Datei
-- **CLAUDE.md** - Guidance für Claude Code (EN)
-- **GITHUB_DEPLOYMENT_GUIDE.md** - VPS Deployment
+### 10. Februar 2026 - Migration Notion -> Supabase (v3.0)
+- Komplett-Migration aller Scripts von Notion API auf Supabase/PostgreSQL
+- Neues Shared Module `supabase_helper.py` mit Retry-Logik und Pagination
+- `sync_final.py`: Excel -> Supabase statt Notion (977 Updates in 68s)
+- `stock_price_updater.py`: Kurse direkt in Supabase (v3, Blacklist mit UUIDs)
+- `isin_wkn_updater.py`: ISIN/WKN direkt in Supabase
+- `morning_sync_complete.py`: Print-Texte aktualisiert
+- Neue `sync_history` Tabelle in Supabase für Logging
+- `.env` aktualisiert: Supabase statt Notion Credentials
+- Notion-Abhängigkeit vollständig entfernt
+- Performance: Morning Sync von 6-8 Min auf ~70 Sek (kein Rate-Limiting mehr)
 
-### Passive Income Generator
-- **GitHub:** https://github.com/rseckler/Passive-Income-Generator
-- **README.md** - Quick Start
-- **ANLEITUNG.md** - Detaillierte Anleitung (DE)
-- **NOTION-SETUP.md** - Database Setup
+### 8. Februar 2026 - Reliability & Performance Fixes (v2.1)
+- Persistent Invalid-Ticker Blacklist
+- Retry-Logik für Notion API
+- PID-Lock für Stock-Updater
+- Log-Rotation auf VPS
 
----
+### 28. Januar 2026 - Intelligente Duplikatserkennung
+- ChatGPT-basierte semantische Duplikatserkennung (Passive Income)
 
-## 🎉 Deployment Changelog
-
-### 8. Februar 2026 - Reliability & Performance Fixes
-- ✅ **Pfad-Fix:** `morning_sync_complete.py` nutzt `os.path.join(SCRIPT_DIR, ...)` statt relativer Pfade (war 12 Tage kaputt)
-- ✅ **Persistent Invalid-Ticker Blacklist:** `invalid_tickers.json` speichert bekannte ungültige Ticker, TTL 7 Tage → Runtime ~54 Min → ~20 Min
-- ✅ **Retry-Logik:** `sync_final.py` hat `_notion_request()` mit Retry bei 429/5xx, Exponential Backoff, `requests.Session()` für Connection-Pooling
-- ✅ **Rate-Limiting:** `time.sleep(0.35)` zwischen Notion API Calls in `sync_final.py` (bleibt unter 3 req/sec)
-- ✅ **Timeout erhöht:** Notion API Timeout 30s → 120s in `sync_final.py`
-- ✅ **Concurrent-Run-Schutz:** `stock_price_updater.py` nutzt `fcntl.flock()` PID-Lock, verhindert parallele Runs
-- ✅ **Log-Rotation:** logrotate auf VPS konfiguriert (stock_prices.log daily/5MB, sync_cron.log + cron.log weekly)
-- ✅ **Monitoring:** Service Overview Dashboard (http://72.62.148.205:3002) zeigt Health-Status aller Services
-
-### 28. Januar 2026 (04:25) - Intelligente Duplikatserkennung
-- ✅ ChatGPT-basierte semantische Duplikatserkennung implementiert
-- ✅ Erkennt konzeptionell ähnliche Ideen (nicht nur exakte Titel)
-- ✅ Nutzt GPT-4o-mini für Ähnlichkeitsanalyse
-- ✅ Test erfolgreich: 2 intelligente Duplikate erkannt und gefiltert
-- ✅ Detailliertes Logging mit Begründungen für gefilterte Duplikate
-- ✅ Fallback zu allen Ideen bei API-Fehler
-- 📊 Beispiele erkannt: "NFT Music Royalties" ≈ "Lizenzierung von Musik"
-
-### 27. Januar 2026 (22:45) - Finale Production Version
-- ✅ Passive Income Generator auf VPS deployed
-- ✅ GitHub Repository erstellt & public
-- ✅ Sync History 404 Problem behoben
-- ✅ Alle 3 Cronjobs aktiv auf VPS
-- ✅ Mac Cronjobs entfernt
-- ✅ Test erfolgreich: 10 Ideen generiert
-- ✅ Beide Projekte vollständig dokumentiert
-
-### 27. Januar 2026 (21:00) - Blackfire VPS Deployment
-- ✅ Blackfire auf VPS deployed
-- ✅ SSH Key Authentication konfiguriert
-- ✅ GitHub Repository public gemacht
-- ✅ Virtual Environments eingerichtet
-- ✅ Notion API Key aktualisiert
-- ✅ 2 Cronjobs migriert (Mac → VPS)
-
-### 27. Januar 2026 (Vormittag) - ISIN/WKN Support
-- ✅ ISIN/WKN Properties hinzugefügt
-- ✅ Hybrid ISIN-Mapper implementiert (OpenFIGI + ChatGPT)
-- ✅ Protected Properties in sync_final.py
-- ✅ Smart Ticker Validation (4-tier)
+### 27. Januar 2026 - Initiales VPS Deployment
+- Alle 3 Cronjobs auf VPS deployed
+- GitHub Repositories erstellt
 
 ---
 
-## ✅ Production Checklist
+## Production Checklist
 
 - [x] VPS Setup & SSH Access
-- [x] GitHub Repositories erstellt (beide public)
-- [x] Code deployed & getestet
+- [x] GitHub Repositories
+- [x] Supabase Migration (Notion entfernt)
+- [x] sync_history Tabelle erstellt
+- [x] supabase_helper.py mit Retry + Pagination
+- [x] sync_final.py getestet (977 Updates)
+- [x] stock_price_updater.py getestet (221+ Kurse)
+- [x] isin_wkn_updater.py getestet (199 ISINs)
 - [x] Credentials konfiguriert (.env)
-- [x] Notion Integrations verbunden
-- [x] Cronjobs installiert & verifiziert
-- [x] Logs funktionieren
-- [x] Mac Cronjobs entfernt
-- [x] Dokumentation vollständig
-- [x] Test-Runs erfolgreich
-- [x] Log-Rotation konfiguriert
+- [x] Cronjobs (gleiche Skript-Namen, keine Änderung nötig)
 - [x] PID-Lock für Stock-Updater
-- [x] Retry-Logik für Notion API
-- [x] Invalid-Ticker Blacklist
-- [x] Service Overview Dashboard deployed
+- [x] Invalid-Companies Blacklist (30d TTL)
+- [x] Log-Rotation konfiguriert
+- [x] Service Overview Dashboard
+- [ ] VPS Deployment (git pull + pip install)
 
-**Status:** 🟢 All Systems Operational
-
----
-
-**Erstellt mit Claude Code** 🤖
-**Deployment:** GitHub → Hostinger VPS
-**Maintenance:** Git Pull für Updates
-**Monitoring:** Service Overview Dashboard (http://72.62.148.205:3002) + Notion Sync History
+**Status:** All Systems Operational (lokal getestet, VPS-Deployment ausstehend)
