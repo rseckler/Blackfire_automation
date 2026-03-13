@@ -1,8 +1,8 @@
 # Blackfire Automation - Systemdokumentation
 
 **Status:** Production Ready - Deployed auf Hostinger VPS
-**Datum:** 10. Februar 2026
-**Version:** 3.0 (Migration Notion -> Supabase)
+**Datum:** 13. März 2026
+**Version:** 3.1 (Hardening + Source Normalization)
 
 ---
 
@@ -73,8 +73,10 @@ Alle Scripts nutzen dieses Modul für Supabase-Zugriff:
 - `get_client()` - Singleton Supabase Client
 - `get_all_companies(select)` - Paginierter Abruf (1000er Batches)
 - `update_company(id, data)` - Update mit Retry (3 Versuche)
+- `update_company_safe(id, data, expected_updated_at)` - Update mit Optimistic Locking (verhindert Race Conditions zwischen Scripts)
 - `insert_companies(list)` - Batch Insert mit Retry
 - `log_sync_history(stats)` - Sync-Log in `sync_history` Tabelle
+- `send_alert_email(subject, body)` - E-Mail Alert via Gmail SMTP (benötigt `ALERT_EMAIL_FROM`, `ALERT_EMAIL_PASSWORD`, `ALERT_EMAIL_TO` in `.env`)
 
 ---
 
@@ -99,6 +101,9 @@ Alle Scripts nutzen dieses Modul für Supabase-Zugriff:
 │   ├── stock_price_updater.py     # Stündliche Kursupdates
 │   ├── isin_wkn_updater.py        # ISIN/WKN Recherche
 │   ├── isin_ticker_mapper.py      # Hybrid ISIN->Ticker (OpenFIGI + ChatGPT)
+│   ├── normalize_sources.py       # Source-Feld Normalisierung (222→40 kanonische Namen)
+│   ├── source_mapping.json        # Mapping raw Source → canonical (248 Einträge)
+│   ├── harvest_symbols.py         # Symbole aus extra_data in core symbol-Feld kopieren
 │   ├── invalid_companies.json     # Blacklist (Supabase UUIDs, TTL 30d)
 │   ├── sync_cron.log
 │   └── stock_prices.log
@@ -138,6 +143,11 @@ SUPABASE_SERVICE_ROLE_KEY=...  # Service Role Key aus Supabase Dashboard
 
 # Dropbox
 DROPBOX_URL=...  # Direct Download Link (?dl=1)
+
+# E-Mail Alerts (Gmail SMTP)
+ALERT_EMAIL_FROM=...@gmail.com
+ALERT_EMAIL_PASSWORD=...  # Gmail App Password (16 Zeichen)
+ALERT_EMAIL_TO=...@gmail.com
 
 # Optional
 BRAVE_API_KEY=...
@@ -298,6 +308,25 @@ git pull
 
 ## Deployment Changelog
 
+### 13. März 2026 - Hardening & Source Normalization (v3.1)
+- **8 Schwachstellen behoben:**
+  1. TypeScript-Fehler in Blackfire_service behoben (52 Errors → 0)
+  2. `ignoreBuildErrors`/`ignoreDuringBuilds` aus next.config.ts entfernt
+  3. Cron Auth für Buy Radar (Vercel cron header + CRON_SECRET)
+  4. RLS Policies für Notes (INSERT/UPDATE/DELETE mit auth.uid() Check)
+  5. Alpha Vantage Fallback-Chain (Redis → PostgreSQL → API)
+  6. Optimistic Locking in `update_company_safe()` (verhindert Race Conditions)
+  7. E-Mail Alerts bei Fehlern (`send_alert_email()` in supabase_helper.py)
+  8. Unused Dependencies entfernt (bullmq, drizzle-orm, recharts, etc.)
+- **Source Normalization:** 222 raw Source-Varianten → ~40 kanonische Namen
+  - `source_mapping.json`: 248 Mapping-Einträge
+  - `normalize_sources.py`: Dry-run + Apply Mode, preserviert Originale in `Source_Original`
+  - 811/811 Records erfolgreich normalisiert
+  - Top Sources: The Information (367), CB Insights (192), Motley Fool (160), Insider Monkey (101)
+- **Supabase TypeScript Types:** Vollständige 1031-Zeilen Type-Definition für alle 17 Tabellen generiert (ersetzt `Database = any`)
+- **ISIN/WKN Coverage analysiert:** Symbol 68%, ISIN 37%, WKN ~0% (korrekt, da meist US-Firmen)
+- **Symbol Harvest:** extra_data → core `symbol` Feld geprüft — bereits vollständig, 0 Änderungen nötig
+
 ### 10. Februar 2026 - Migration Notion -> Supabase (v3.0)
 - Komplett-Migration aller Scripts von Notion API auf Supabase/PostgreSQL
 - Neues Shared Module `supabase_helper.py` mit Retry-Logik und Pagination
@@ -349,5 +378,9 @@ git pull
 - [x] VPS Test: test_complete_system.py (3/10 Stocks erfolgreich)
 - [x] VPS Test: stock_price_updater.py (Full Run verifiziert)
 - [x] Alte Notion-Backup-Dateien aufgeräumt (lokal + VPS)
+- [x] Optimistic Locking für concurrent Updates (v3.1)
+- [x] E-Mail Alerts bei Script-Fehlern (Gmail SMTP)
+- [x] Source Normalization (222 → 40 kanonische Namen)
+- [x] Source Mapping JSON (248 Einträge)
 
 **Status:** All Systems Operational - VPS Production Deployed
