@@ -16,3 +16,6 @@ yfinance>=0.2.40
 
 # Supabase (PostgreSQL)
 supabase>=2.0.0
+
+# Anthropic API (Claude Haiku for AI enrichment)
+anthropic>=0.40.0

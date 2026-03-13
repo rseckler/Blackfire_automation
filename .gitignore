@@ -83,6 +83,7 @@ compare_*.txt
 configure_*.py
 create_minimal_workflow.py
 fix_*.py
+!fix_tickers.py
 setup_*.py
 test_*.py
 
