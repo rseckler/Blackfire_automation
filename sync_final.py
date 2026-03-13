@@ -38,7 +38,10 @@ PROTECTED_PROPERTIES = {
     'Market_Cap',
     # ISIN/WKN (managed by isin_wkn_updater.py)
     'ISIN',
-    'WKN'
+    'WKN',
+    # Data quality (managed by classify_listing_status.py / normalize_data.py)
+    'listing_status',
+    'prio_buy',
 }
 
 
@@ -156,6 +159,18 @@ class SyncWithLogging:
 
         if extra_data:
             company_data['extra_data'] = extra_data
+
+        # Also write promoted JSONB fields to real columns
+        PROMOTED_FIELDS = {
+            'Thier_Group': 'thier_group',
+            'VIP': 'vip',
+            'Industry': 'industry',
+            'Leverage': 'leverage',
+        }
+        for ed_key, col_name in PROMOTED_FIELDS.items():
+            val = extra_data.get(ed_key)
+            if val is not None and str(val).strip():
+                company_data[col_name] = str(val).strip()
 
         return company_data
 
