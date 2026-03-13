@@ -460,6 +460,15 @@ class StockPriceUpdater:
             if self.stats['start_time']:
                 self.log_sync()
 
+            # Send alert email on failure
+            supabase_helper.send_alert_email(
+                "Stock Price Update FAILED",
+                f"Stock price update failed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.\n"
+                f"Error: {e}\n"
+                f"Processed: {self.stats['stocks_processed']}, Updated: {self.stats['stocks_updated']}\n\n"
+                "Check logs: tail -f ~/Blackfire_automation/stock_prices.log"
+            )
+
             return False
 
 

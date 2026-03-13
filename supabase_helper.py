@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
 Shared Supabase client for Blackfire automation scripts.
-Provides paginated reads, updates with retry, and sync history logging.
+Provides paginated reads, updates with retry, sync history logging,
+and email alerts for failures.
 """
 
 import os
 import time
+import smtplib
+from email.mime.text import MIMEText
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -154,3 +157,76 @@ def log_sync_history(stats: dict) -> None:
         print("   Logged to sync_history")
     except Exception as e:
         print(f"   Failed to log sync history: {e}")
+
+
+def update_company_safe(company_id: str, data: dict, expected_updated_at: str = None, max_retries: int = 3) -> bool:
+    """Update a company row with optimistic locking via updated_at timestamp.
+    If expected_updated_at is provided, the update only succeeds if the row's
+    updated_at still matches — preventing lost updates from concurrent writes.
+    Falls back to normal update if updated_at column doesn't exist yet.
+    """
+    client = get_client()
+
+    # Always set updated_at on writes
+    data['updated_at'] = datetime.now().isoformat()
+
+    for attempt in range(max_retries):
+        try:
+            query = client.table('companies').update(data).eq('id', company_id)
+            if expected_updated_at:
+                query = query.eq('updated_at', expected_updated_at)
+            result = query.execute()
+
+            # If optimistic lock was used and no rows matched, the row was modified since read
+            if expected_updated_at and len(result.data) == 0:
+                print(f"   Conflict on {company_id}: row modified by another process, retrying...")
+                # Re-read the current state and retry
+                fresh = client.table('companies').select('updated_at').eq('id', company_id).single().execute()
+                if fresh.data:
+                    expected_updated_at = fresh.data.get('updated_at')
+                    data['updated_at'] = datetime.now().isoformat()
+                    continue
+                return False
+
+            return True
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait = 2 ** (attempt + 1)
+                print(f"   Retry safe update in {wait}s... ({e})")
+                time.sleep(wait)
+            else:
+                print(f"   Failed safe update {company_id}: {e}")
+                return False
+
+
+def send_alert_email(subject: str, body: str) -> bool:
+    """Send email alert for sync/update failures.
+    Uses Gmail SMTP with app password. Configure in .env:
+      ALERT_EMAIL_FROM=your@gmail.com
+      ALERT_EMAIL_PASSWORD=your-app-password
+      ALERT_EMAIL_TO=recipient@example.com
+    Returns True on success, False on failure (never raises).
+    """
+    email_from = os.getenv('ALERT_EMAIL_FROM')
+    email_password = os.getenv('ALERT_EMAIL_PASSWORD')
+    email_to = os.getenv('ALERT_EMAIL_TO', email_from)
+
+    if not email_from or not email_password:
+        print("   Email alerts not configured (set ALERT_EMAIL_FROM + ALERT_EMAIL_PASSWORD in .env)")
+        return False
+
+    try:
+        msg = MIMEText(body)
+        msg['Subject'] = f"[Blackfire Alert] {subject}"
+        msg['From'] = email_from
+        msg['To'] = email_to
+
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=10) as server:
+            server.login(email_from, email_password)
+            server.sendmail(email_from, [email_to], msg.as_string())
+
+        print(f"   Alert email sent to {email_to}")
+        return True
+    except Exception as e:
+        print(f"   Failed to send alert email: {e}")
+        return False

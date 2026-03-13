@@ -9,8 +9,10 @@ import subprocess
 import sys
 import os
 from datetime import datetime
+from dotenv import load_dotenv
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(SCRIPT_DIR, '.env'))
 
 print("=" * 70)
 print("  MORNING SYNC - COMPLETE")
@@ -27,6 +29,16 @@ result1 = subprocess.run(
 
 if result1.returncode != 0:
     print("\n  Excel sync failed!")
+    try:
+        import supabase_helper
+        supabase_helper.send_alert_email(
+            "Morning Sync FAILED — Excel Sync",
+            f"Excel → Supabase sync failed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.\n"
+            f"Exit code: {result1.returncode}\n\n"
+            "Check logs: tail -f ~/Blackfire_automation/sync_cron.log"
+        )
+    except Exception:
+        pass
     exit(1)
 
 # Step 2: ISIN/WKN Research
