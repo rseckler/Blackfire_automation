@@ -2,7 +2,7 @@
 
 **Status:** Production Ready - Deployed auf Hostinger VPS
 **Datum:** 13. März 2026
-**Version:** 3.1 (Hardening + Source Normalization)
+**Version:** 3.2 (Data Quality Phase 1 + JSONB Columns + Auth + Sentry)
 
 ---
 
@@ -104,6 +104,12 @@ Alle Scripts nutzen dieses Modul für Supabase-Zugriff:
 │   ├── normalize_sources.py       # Source-Feld Normalisierung (222→40 kanonische Namen)
 │   ├── source_mapping.json        # Mapping raw Source → canonical (248 Einträge)
 │   ├── harvest_symbols.py         # Symbole aus extra_data in core symbol-Feld kopieren
+│   ├── normalize_data.py          # Daten-Normalisierung (läuft bei jedem Sync)
+│   ├── classify_listing_status.py # AI Listing-Status Klassifikation (wöchentlich Mo)
+│   ├── ai_data_enrichment.py      # Claude AI Datenanreicherung (manuell --apply)
+│   ├── fix_tickers.py             # Ticker-Korrektur via OpenFIGI (manuell --apply)
+│   ├── extract_sources.py         # Source-Extraktion Utility
+│   ├── promote_jsonb_fields.py    # JSONB→Real Columns Migration
 │   ├── invalid_companies.json     # Blacklist (Supabase UUIDs, TTL 30d)
 │   ├── sync_cron.log
 │   └── stock_prices.log
@@ -148,6 +154,9 @@ DROPBOX_URL=...  # Direct Download Link (?dl=1)
 ALERT_EMAIL_FROM=...@gmail.com
 ALERT_EMAIL_PASSWORD=...  # Gmail App Password (16 Zeichen)
 ALERT_EMAIL_TO=...@gmail.com
+
+# AI Data Enrichment (Claude)
+ANTHROPIC_API_KEY=...  # Für ai_data_enrichment.py, classify_listing_status.py, fix_tickers.py
 
 # Optional
 BRAVE_API_KEY=...
@@ -308,6 +317,27 @@ git pull
 
 ## Deployment Changelog
 
+### 13. März 2026 - Data Quality Phase 1 & Full Hardening (v3.2)
+- **Data Quality Scripts (VPS deployed):**
+  - `normalize_data.py`: Normalisiert Key-Felder (läuft automatisch bei jedem Morning Sync)
+  - `classify_listing_status.py`: AI-basierte Listing-Status Klassifikation (wöchentlich Montags im Morning Sync)
+  - `ai_data_enrichment.py`: Claude Haiku Datenanreicherung für fehlende Felder (Country, Competitors, Profile, Sector) — manuell mit `--apply`
+  - `fix_tickers.py`: Ticker-Korrektur via OpenFIGI für Companies ohne Symbol — manuell mit `--apply`
+  - `extract_sources.py`: Source-Extraktion Utility
+- **JSONB → Real Columns:**
+  - `thier_group`, `vip`, `industry`, `leverage` als echte PostgreSQL-Spalten (vorher nur in extra_data JSONB)
+  - B-tree Indexes auf thier_group, vip, industry
+  - `sync_final.py` schreibt jetzt in beide (real columns + extra_data)
+  - `promote_jsonb_fields.py`: Migrations-Script + SQL Migration
+  - Daten: thier_group 1715/1732, vip 1715/1732, industry 1450/1732, leverage 1583/1732
+- **Neue DB-Spalten:** `listing_status`, `prio_buy` in companies Tabelle
+- **4 neue Tabellen:** company_news, company_events, company_scores, alerts
+- **Morning Sync erweitert:** normalize_data bei jedem Sync, classify_listing_status montags
+- **ANTHROPIC_API_KEY** auf VPS konfiguriert
+- **Dependencies:** `anthropic>=0.40.0` hinzugefügt (v0.84.0 installiert)
+- **Google OAuth:** Supabase Auth Provider für Blackfire_service
+- **Sentry:** Error Tracking für Blackfire_service (@sentry/nextjs)
+
 ### 13. März 2026 - Hardening & Source Normalization (v3.1)
 - **8 Schwachstellen behoben:**
   1. TypeScript-Fehler in Blackfire_service behoben (52 Errors → 0)
@@ -389,5 +419,13 @@ git pull
 - [x] E-Mail Alerts bei Script-Fehlern (Gmail SMTP)
 - [x] Source Normalization (222 → 40 kanonische Namen)
 - [x] Source Mapping JSON (248 Einträge)
+- [x] Data Quality Scripts deployed (normalize, classify, AI enrich, fix tickers)
+- [x] JSONB → Real Columns (thier_group, vip, industry, leverage)
+- [x] listing_status + prio_buy Spalten
+- [x] 4 neue Tabellen (company_news, company_events, company_scores, alerts)
+- [x] ANTHROPIC_API_KEY auf VPS konfiguriert
+- [x] Morning Sync erweitert (normalize + classify integriert)
+- [x] Google OAuth (Blackfire_service)
+- [x] Sentry Error Tracking (Blackfire_service)
 
-**Status:** All Systems Operational - VPS Production Deployed
+**Status:** All Systems Operational - VPS Production Deployed (v3.2)
