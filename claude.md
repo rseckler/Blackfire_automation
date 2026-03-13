@@ -326,6 +326,13 @@ git pull
 - **Supabase TypeScript Types:** Vollständige 1031-Zeilen Type-Definition für alle 17 Tabellen generiert (ersetzt `Database = any`)
 - **ISIN/WKN Coverage analysiert:** Symbol 68%, ISIN 37%, WKN ~0% (korrekt, da meist US-Firmen)
 - **Symbol Harvest:** extra_data → core `symbol` Feld geprüft — bereits vollständig, 0 Änderungen nötig
+- **Systemcheck verifiziert (13.03.2026):**
+  - Supabase: 1732 Companies, 1189 mit Symbol (69%), 656 mit ISIN (38%), 581 mit Preis (34%)
+  - Stock Updates stündlich aktiv (letztes 14:14 UTC)
+  - Buy Radar: 4007 Analysen, täglich um 06:00 UTC
+  - Notes: 3544 aktiv mit RLS Policies
+  - Vercel Production: READY (alle Commits deployed)
+  - Blackfire_automation VPS: git pulled, alle Scripts aktuell
 
 ### 10. Februar 2026 - Migration Notion -> Supabase (v3.0)
 - Komplett-Migration aller Scripts von Notion API auf Supabase/PostgreSQL
