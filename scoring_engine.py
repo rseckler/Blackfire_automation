@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """
-Blackfire Scoring Engine — calculates a composite score (0-100) per company.
+Blackfire Scoring Engine v2 — calculates a composite score (0-100) per company.
 
 Score Components:
-  - Data Quality   (20%): Field completeness
-  - Manual Rating  (30%): Thier_Group + VIP + Prio_Buy
-  - Price Momentum (20%): Price vs 52W range
-  - News Sentiment (15%): Positive/negative news ratio
-  - Catalyst Prox. (15%): Upcoming events proximity
+  - Valuation Gap    (25%): Analyst target / purchase price vs current price
+  - Conviction Signal(25%): Thier_Group + VIP + Prio_Buy
+  - Price Momentum   (20%): Price vs 52W range
+  - News Sentiment   (15%): Positive/negative news ratio
+  - Catalyst Prox.   (15%): Upcoming events proximity
+
+Score Labels:
+  80-100  Strong Buy
+  60-79   Accumulate
+  40-59   Hold
+  20-39   Review
+   0-19   Remove
 
 Usage:
   python3 scoring_engine.py                    # dry-run (preview only)
@@ -29,19 +36,14 @@ import supabase_helper
 
 # ── Score weights ──
 WEIGHTS = {
-    'data_quality': 0.20,
-    'manual_rating': 0.30,
+    'valuation_gap': 0.25,
+    'conviction_signal': 0.25,
     'price_momentum': 0.20,
     'news_sentiment': 0.15,
     'catalyst_proximity': 0.15,
 }
 
-# ── Data Quality: fields to check ──
-QUALITY_FIELDS_COMPANY = ['symbol', 'isin', 'wkn']
-QUALITY_FIELDS_EXTRA = ['Industry', 'Country', 'Sector', 'Sector_Specific', 'Profile', 'Competitors']
-TOTAL_QUALITY_FIELDS = len(QUALITY_FIELDS_COMPANY) + len(QUALITY_FIELDS_EXTRA)
-
-# ── Manual Rating mappings ──
+# ── Conviction Signal mappings ──
 THIER_GROUP_MAP = {
     '2026***': 100, '2026**': 80, '2026*': 60, '2026': 40,
     '2025***': 35, '2025**': 30, '2025*': 25, '2025': 20,
@@ -52,25 +54,104 @@ VIP_MAP = {
 PRIO_BUY_MAP = {1: 100, 2: 80, 3: 60, 4: 40, 5: 20}
 
 
-def score_data_quality(company: dict) -> float:
-    """Score field completeness (0-100)."""
+def get_score_label(score: float) -> str:
+    """Map overall score to a human-readable label."""
+    if score >= 80:
+        return 'Strong Buy'
+    if score >= 60:
+        return 'Accumulate'
+    if score >= 40:
+        return 'Hold'
+    if score >= 20:
+        return 'Review'
+    return 'Remove'
+
+
+def _get_price(company: dict) -> float | None:
+    """Extract current price from company row."""
+    price = company.get('current_price')
+    if not price:
+        extra = company.get('extra_data') or {}
+        price_str = extra.get('Current_Price')
+        if price_str:
+            try:
+                price = float(str(price_str).replace(',', '.'))
+            except (ValueError, TypeError):
+                return None
+    if not price or float(price) <= 0:
+        return None
+    return float(price)
+
+
+def score_valuation_gap(company: dict) -> float:
+    """Score valuation gap (0-100).
+
+    Priority:
+      1. Analyst_Target_Mean vs current_price
+      2. Purchase_$ vs current_price
+      3. Forward_PE < 15 AND Revenue_Growth > 20% → 75
+      4. Neutral → 50
+    """
     extra = company.get('extra_data') or {}
-    filled = 0
+    price = _get_price(company)
 
-    for f in QUALITY_FIELDS_COMPANY:
-        val = company.get(f)
-        if val and str(val).strip() not in ('', 'None', 'null', 'nan', 'N/A'):
-            filled += 1
+    def _map_gap_pct(gap_pct: float) -> float:
+        """Map gap percentage to score.
+        -50% → 0, 0% → 50, +100% → 85, +200% → 100
+        """
+        if gap_pct <= -50:
+            return 0.0
+        if gap_pct <= 0:
+            # Linear from 0 (-50%) to 50 (0%)
+            return (gap_pct + 50) / 50 * 50
+        if gap_pct <= 100:
+            # Linear from 50 (0%) to 85 (+100%)
+            return 50 + (gap_pct / 100) * 35
+        if gap_pct <= 200:
+            # Linear from 85 (+100%) to 100 (+200%)
+            return 85 + ((gap_pct - 100) / 100) * 15
+        return 100.0
 
-    for f in QUALITY_FIELDS_EXTRA:
-        val = extra.get(f)
-        if val and str(val).strip() not in ('', 'None', 'null', 'nan', 'N/A', '-'):
-            filled += 1
+    # 1. Analyst target vs current price
+    if price:
+        target_str = extra.get('Analyst_Target_Mean')
+        if target_str is not None:
+            try:
+                target = float(str(target_str).replace(',', '.'))
+                if target > 0:
+                    gap_pct = (target - price) / price * 100
+                    return round(_map_gap_pct(gap_pct), 1)
+            except (ValueError, TypeError):
+                pass
 
-    return round((filled / TOTAL_QUALITY_FIELDS) * 100, 1)
+        # 2. Purchase price as target proxy
+        purchase_str = extra.get('Purchase_$')
+        if purchase_str is not None:
+            try:
+                purchase = float(str(purchase_str).replace(',', '.'))
+                if purchase > 0:
+                    gap_pct = (purchase - price) / price * 100
+                    return round(_map_gap_pct(gap_pct), 1)
+            except (ValueError, TypeError):
+                pass
+
+    # 3. Cheap growth heuristic
+    fwd_pe_str = extra.get('Forward_PE')
+    rev_growth_str = extra.get('Revenue_Growth')
+    if fwd_pe_str is not None and rev_growth_str is not None:
+        try:
+            fwd_pe = float(str(fwd_pe_str).replace(',', '.'))
+            rev_growth = float(str(rev_growth_str).replace(',', '.'))
+            if fwd_pe < 15 and rev_growth > 0.2:
+                return 75.0
+        except (ValueError, TypeError):
+            pass
+
+    # 4. Neutral
+    return 50.0
 
 
-def score_manual_rating(company: dict) -> float:
+def score_conviction_signal(company: dict) -> float:
     """Score from Thier_Group + VIP + Prio_Buy (0-100)."""
     extra = company.get('extra_data') or {}
 
@@ -99,20 +180,10 @@ def score_manual_rating(company: dict) -> float:
 def score_price_momentum(company: dict) -> float:
     """Score price momentum (0-100). No data = 50 (neutral)."""
     extra = company.get('extra_data') or {}
-    price = company.get('current_price')
+    price = _get_price(company)
 
     if not price:
-        price_str = extra.get('Current_Price')
-        if price_str:
-            try:
-                price = float(str(price_str).replace(',', '.'))
-            except (ValueError, TypeError):
-                return 50.0
-
-    if not price or price <= 0:
         return 50.0
-
-    price = float(price)
 
     # Check 52-week range
     high_52w = extra.get('52W_High') or extra.get('52_Week_High')
@@ -238,13 +309,13 @@ def load_events_cache(client) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Calculate Blackfire Scores')
+    parser = argparse.ArgumentParser(description='Calculate Blackfire Scores v2')
     parser.add_argument('--apply', action='store_true', help='Write scores to Supabase')
     parser.add_argument('--limit', type=int, default=0, help='Limit number of companies')
     args = parser.parse_args()
 
     print("\n" + "=" * 70)
-    print("  BLACKFIRE SCORING ENGINE")
+    print("  BLACKFIRE SCORING ENGINE v2")
     print(f"  Mode: {'APPLY' if args.apply else 'DRY-RUN (preview only)'}")
     if args.limit:
         print(f"  Limit: {args.limit} companies")
@@ -271,16 +342,16 @@ def main():
     print(f"  Event entries: {sum(len(v) for v in events_cache.values())}")
 
     # Calculate scores
-    today = datetime.now().date().isoformat()
     results = []
     score_dist = Counter()
+    label_dist = Counter()
 
     for company in companies:
         cid = company['id']
 
         components = {
-            'data_quality': score_data_quality(company),
-            'manual_rating': score_manual_rating(company),
+            'valuation_gap': score_valuation_gap(company),
+            'conviction_signal': score_conviction_signal(company),
             'price_momentum': score_price_momentum(company),
             'news_sentiment': score_news_sentiment(cid, news_cache),
             'catalyst_proximity': score_catalyst_proximity(cid, events_cache),
@@ -288,19 +359,23 @@ def main():
 
         overall = sum(components[k] * WEIGHTS[k] for k in WEIGHTS)
         overall = round(overall, 1)
+        label = get_score_label(overall)
 
         # Bucket for distribution
         if overall >= 70:
-            score_dist['good (≥70)'] += 1
+            score_dist['good (>=70)'] += 1
         elif overall >= 40:
             score_dist['medium (40-69)'] += 1
         else:
             score_dist['low (<40)'] += 1
 
+        label_dist[label] += 1
+
         results.append({
             'company_id': cid,
             'name': company.get('name', '?'),
             'overall': overall,
+            'label': label,
             'components': components,
         })
 
@@ -312,13 +387,18 @@ def main():
     for bucket, count in sorted(score_dist.items()):
         print(f"    {bucket:20s}: {count:5d}")
 
+    print(f"\n  Label distribution:")
+    for label in ['Strong Buy', 'Accumulate', 'Hold', 'Review', 'Remove']:
+        count = label_dist.get(label, 0)
+        print(f"    {label:20s}: {count:5d}")
+
     print(f"\n  Top 10:")
     for r in results[:10]:
-        print(f"    {r['overall']:5.1f}  {r['name'][:50]}")
+        print(f"    {r['overall']:5.1f} [{r['label']:11s}]  {r['name'][:50]}")
 
     print(f"\n  Bottom 10:")
     for r in results[-10:]:
-        print(f"    {r['overall']:5.1f}  {r['name'][:50]}")
+        print(f"    {r['overall']:5.1f} [{r['label']:11s}]  {r['name'][:50]}")
 
     # Apply
     if args.apply:
@@ -337,12 +417,15 @@ def main():
         # Batch insert in chunks of 50
         batch = []
         for i, r in enumerate(results):
-            # Overall score
+            # Overall score with label in details
+            details_with_label = dict(r['components'])
+            details_with_label['score_label'] = r['label']
+
             batch.append({
                 'company_id': r['company_id'],
                 'score_type': 'overall',
                 'score_value': r['overall'],
-                'details': r['components'],
+                'details': details_with_label,
                 'computed_at': now,
             })
 

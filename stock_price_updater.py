@@ -252,7 +252,7 @@ class StockPriceUpdater:
             return None
 
     def fetch_stock_price(self, symbol):
-        """Fetch stock price using yfinance"""
+        """Fetch stock price and fundamentals using yfinance"""
         try:
             self.stats['api_calls'] += 1
 
@@ -263,14 +263,66 @@ class StockPriceUpdater:
             if not current_price or current_price == 0:
                 return None
 
-            return {
+            result = {
                 'current_price': current_price,
                 'change_percent': info.get('regularMarketChangePercent', 0),
                 'high': info.get('dayHigh', 0),
                 'low': info.get('dayLow', 0),
                 'volume': info.get('volume', 0),
-                'market_cap': info.get('marketCap', 0)
+                'market_cap': info.get('marketCap', 0),
             }
+
+            # Extract fundamentals from ticker.info (WP-9.1)
+            fundamentals = {}
+
+            # Valuation ratios
+            for yf_key, db_key in [
+                ('trailingPE', 'PE_Ratio'),
+                ('forwardPE', 'Forward_PE'),
+                ('priceToBook', 'Price_To_Book'),
+                ('priceToSalesTrailing12Months', 'Price_To_Sales'),
+                ('enterpriseToRevenue', 'EV_To_Revenue'),
+                ('debtToEquity', 'Debt_To_Equity'),
+            ]:
+                val = info.get(yf_key)
+                if val is not None and val != 0:
+                    fundamentals[db_key] = round(float(val), 4)
+
+            # Revenue & growth
+            for yf_key, db_key in [
+                ('totalRevenue', 'Revenue'),
+                ('revenueGrowth', 'Revenue_Growth'),
+                ('earningsGrowth', 'Earnings_Growth'),
+            ]:
+                val = info.get(yf_key)
+                if val is not None:
+                    fundamentals[db_key] = float(val)
+
+            # Analyst targets
+            for yf_key, db_key in [
+                ('targetMeanPrice', 'Analyst_Target_Mean'),
+                ('targetHighPrice', 'Analyst_Target_High'),
+                ('targetLowPrice', 'Analyst_Target_Low'),
+                ('numberOfAnalystOpinions', 'Analyst_Count'),
+                ('recommendationMean', 'Recommendation_Mean'),
+            ]:
+                val = info.get(yf_key)
+                if val is not None and val != 0:
+                    fundamentals[db_key] = float(val)
+
+            # 52-week range
+            for yf_key, db_key in [
+                ('fiftyTwoWeekHigh', '52W_High'),
+                ('fiftyTwoWeekLow', '52W_Low'),
+            ]:
+                val = info.get(yf_key)
+                if val is not None and val > 0:
+                    fundamentals[db_key] = round(float(val), 4)
+
+            if fundamentals:
+                result['fundamentals'] = fundamentals
+
+            return result
 
         except Exception:
             return None
@@ -292,7 +344,7 @@ class StockPriceUpdater:
             return 'Closed'
 
     def update_stock(self, company_id, symbol, price_data):
-        """Update company with stock price data in Supabase"""
+        """Update company with stock price data and fundamentals in Supabase"""
         if not price_data:
             return False
 
@@ -320,6 +372,21 @@ class StockPriceUpdater:
 
         if price_data.get('market_cap'):
             update_data['market_cap'] = int(price_data['market_cap'])
+
+        # Merge fundamentals into extra_data JSONB (WP-9.1)
+        fundamentals = price_data.get('fundamentals')
+        if fundamentals:
+            # Read current extra_data to merge (don't overwrite other keys)
+            try:
+                client = supabase_helper.get_client()
+                resp = client.table('companies').select('extra_data').eq('id', company_id).execute()
+                existing_extra = (resp.data[0].get('extra_data') or {}) if resp.data else {}
+            except Exception:
+                existing_extra = {}
+
+            existing_extra.update(fundamentals)
+            existing_extra['Fundamentals_Update'] = datetime.now().isoformat()
+            update_data['extra_data'] = existing_extra
 
         return supabase_helper.update_company(company_id, update_data)
 
