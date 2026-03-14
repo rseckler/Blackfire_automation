@@ -17,6 +17,11 @@ Usage:
   python3 news_collector.py --rss-only       # skip Brave, only RSS feeds
   python3 news_collector.py --no-sentiment   # skip sentiment analysis (faster)
   python3 news_collector.py --backfill-sentiment  # backfill sentiment on existing articles
+
+Features:
+  - Relevance scoring (1-5) for investment decision prioritization
+  - Industry-level news matching for articles not tied to specific companies
+  - Automatic alert creation for high-relevance news (relevance >= 4)
 """
 
 import argparse
@@ -104,6 +109,23 @@ ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY', '')
 
 # Minimum company name length for matching (avoid false positives)
 MIN_NAME_LENGTH = 3
+
+# Industry keywords for matching articles to industries (not specific companies)
+INDUSTRY_KEYWORDS = {
+    'AI': ['artificial intelligence', 'machine learning', 'neural network', 'LLM', 'GPT', 'deep learning'],
+    'Semiconductor': ['chip', 'semiconductor', 'wafer', 'fab', 'TSMC', 'foundry'],
+    'Quantum': ['quantum computing', 'qubit', 'quantum advantage'],
+    'Cyber Security': ['cybersecurity', 'ransomware', 'zero trust', 'SIEM'],
+    'Robotics': ['robot', 'automation', 'autonomous'],
+    'Blockchain': ['blockchain', 'crypto', 'DeFi', 'web3'],
+    'Biotech': ['biotech', 'gene therapy', 'CRISPR', 'clinical trial', 'FDA'],
+    'Clean Energy': ['solar', 'wind energy', 'battery', 'EV charging', 'hydrogen'],
+    'Space': ['satellite', 'rocket', 'space launch', 'orbital'],
+    'Defense': ['defense contract', 'military', 'NATO', 'Pentagon'],
+}
+
+# Alert priority thresholds
+RELEVANCE_ALERT_THRESHOLD = 4  # relevance >= 4 triggers alert creation
 
 # Words to exclude from matching (too generic, cause false positives)
 GENERIC_WORDS = {
@@ -270,6 +292,23 @@ def match_article_to_companies(title: str, summary: str, index: dict) -> list:
             if name_lower in text_lower:
                 matched.append(company)
                 matched_ids.add(cid)
+
+    return matched
+
+
+def match_article_to_industries(title: str, summary: str) -> list:
+    """Match an article to industries by keyword matching.
+
+    Returns list of matched industry names (may be empty).
+    """
+    text_lower = f"{title} {summary or ''}".lower()
+    matched = []
+
+    for industry, keywords in INDUSTRY_KEYWORDS.items():
+        for keyword in keywords:
+            if keyword.lower() in text_lower:
+                matched.append(industry)
+                break  # one match per industry is enough
 
     return matched
 
@@ -560,7 +599,7 @@ def normalize_url(url: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _build_sentiment_prompt(articles: list, company_map: dict) -> str:
-    """Build prompt for Claude Haiku sentiment analysis."""
+    """Build prompt for Claude Haiku sentiment analysis with relevance scoring."""
     articles_text = []
     for i, article in enumerate(articles):
         company_name = company_map.get(article.get('company_id', ''), 'Unknown')
@@ -573,6 +612,12 @@ def _build_sentiment_prompt(articles: list, company_map: dict) -> str:
 - index: article number (1-based)
 - sentiment: "positive", "negative", or "neutral"
 - catalyst_type: if this is a potential catalyst, what type? (earnings, fda, partnership, ipo, acquisition, product_launch, regulatory, leadership, funding, null)
+- relevance: 1-5 how relevant is this for investment decisions?
+  5 = Major event (acquisition, IPO pricing, FDA approval, major partnership)
+  4 = Significant news (earnings beat/miss, new product, leadership change)
+  3 = Moderate relevance (analyst upgrade/downgrade, industry trend)
+  2 = Minor news (general mention, market commentary)
+  1 = Low relevance (tangential mention, general market noise)
 
 Articles:
 {chr(10).join(articles_text)}
@@ -589,14 +634,14 @@ def analyze_sentiment_batch(articles: list, anthropic_client: Anthropic, company
         company_map: {company_id: company_name} mapping
 
     Returns:
-        list of dicts with index, sentiment, catalyst_type
+        list of dicts with index, sentiment, catalyst_type, relevance
     """
     prompt = _build_sentiment_prompt(articles, company_map)
 
     try:
         response = anthropic_client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=1500,
+            max_tokens=2000,
             messages=[{"role": "user", "content": prompt}]
         )
         text = response.content[0].text.strip()
@@ -620,7 +665,7 @@ def analyze_sentiment_batch(articles: list, anthropic_client: Anthropic, company
 def run_sentiment_analysis(news_to_insert: list, company_map: dict, stats: Counter):
     """Run sentiment analysis on all articles to be inserted.
 
-    Modifies articles in-place, setting 'sentiment' and 'catalyst_type' fields.
+    Modifies articles in-place, setting 'sentiment', 'catalyst_type', and 'relevance' fields.
     """
     if not ANTHROPIC_API_KEY:
         print("\n  Sentiment: SKIPPED (no ANTHROPIC_API_KEY in .env)")
@@ -630,7 +675,7 @@ def run_sentiment_analysis(news_to_insert: list, company_map: dict, stats: Count
     batches = [news_to_insert[i:i + SENTIMENT_BATCH_SIZE]
                for i in range(0, len(news_to_insert), SENTIMENT_BATCH_SIZE)]
 
-    print(f"\n  Phase 3: Sentiment Analysis (Claude Haiku)")
+    print(f"\n  Phase 3: Sentiment Analysis + Relevance Scoring (Claude Haiku)")
     print("  " + "-" * 40)
     print(f"  Analyzing {len(news_to_insert)} articles in {len(batches)} batches...")
 
@@ -651,16 +696,29 @@ def run_sentiment_analysis(news_to_insert: list, company_map: dict, stats: Count
                         batch[idx]['catalyst_type'] = str(catalyst).lower()
                         stats['catalyst_detected'] += 1
 
+                    relevance = result.get('relevance')
+                    if relevance is not None:
+                        try:
+                            relevance = int(relevance)
+                            if 1 <= relevance <= 5:
+                                batch[idx]['relevance'] = relevance
+                                stats['relevance_scored'] += 1
+                                if relevance >= RELEVANCE_ALERT_THRESHOLD:
+                                    stats['high_relevance'] += 1
+                        except (ValueError, TypeError):
+                            pass
+
         if (batch_idx + 1) % 10 == 0 or batch_idx == len(batches) - 1:
             print(f"    ... {batch_idx + 1}/{len(batches)} batches done "
                   f"({stats.get('sentiment_analyzed', 0)} analyzed, "
-                  f"{stats.get('catalyst_detected', 0)} catalysts)")
+                  f"{stats.get('catalyst_detected', 0)} catalysts, "
+                  f"{stats.get('high_relevance', 0)} high-relevance)")
 
         time.sleep(SENTIMENT_RATE_LIMIT_DELAY)
 
 
 def backfill_sentiment():
-    """Backfill sentiment on existing articles where sentiment IS NULL."""
+    """Backfill sentiment and relevance on existing articles where sentiment IS NULL."""
     if not ANTHROPIC_API_KEY:
         print("\n  ERROR: ANTHROPIC_API_KEY not set in .env")
         sys.exit(1)
@@ -704,6 +762,7 @@ def backfill_sentiment():
 
     total_updated = 0
     total_catalysts = 0
+    total_relevance = 0
 
     for batch_idx, batch in enumerate(batches):
         results = analyze_sentiment_batch(batch, anthropic_client, company_map)
@@ -724,6 +783,16 @@ def backfill_sentiment():
                         update_data['catalyst_type'] = str(catalyst).lower()
                         total_catalysts += 1
 
+                    relevance = result.get('relevance')
+                    if relevance is not None:
+                        try:
+                            relevance = int(relevance)
+                            if 1 <= relevance <= 5:
+                                update_data['relevance'] = relevance
+                                total_relevance += 1
+                        except (ValueError, TypeError):
+                            pass
+
                     if update_data:
                         try:
                             client.table('company_news') \
@@ -736,12 +805,106 @@ def backfill_sentiment():
 
         if (batch_idx + 1) % 10 == 0 or batch_idx == len(batches) - 1:
             print(f"    ... {batch_idx + 1}/{len(batches)} batches done "
-                  f"({total_updated} updated, {total_catalysts} catalysts)")
+                  f"({total_updated} updated, {total_catalysts} catalysts, "
+                  f"{total_relevance} relevance scored)")
 
         time.sleep(SENTIMENT_RATE_LIMIT_DELAY)
 
     print(f"\n  Backfill complete: {total_updated} articles updated, "
-          f"{total_catalysts} catalysts detected.")
+          f"{total_catalysts} catalysts detected, {total_relevance} relevance scored.")
+
+
+# ---------------------------------------------------------------------------
+# Alert creation for high-relevance news
+# ---------------------------------------------------------------------------
+
+def create_news_alerts(news_to_insert: list, company_map: dict,
+                       watchlist_ids: set, highvalue_ids: set,
+                       client, stats: Counter, dry_run: bool):
+    """Create alerts for high-relevance news articles (relevance >= 4).
+
+    Alert priority rules:
+      - Company on watchlist: HIGH priority
+      - Company is Defcon 1/2 or Thier 2026**/2026***: MEDIUM priority
+      - Other companies: no alert (just stored with high relevance)
+    """
+    alerts_to_create = []
+
+    for article in news_to_insert:
+        relevance = article.get('relevance')
+        if not relevance or relevance < RELEVANCE_ALERT_THRESHOLD:
+            continue
+
+        company_id = article.get('company_id')
+        if not company_id:
+            continue  # skip industry-only articles for alerts
+
+        company_name = company_map.get(company_id, 'Unknown')
+        title = article.get('title', '')[:200]
+
+        # Determine alert priority
+        priority = None
+        if company_id in watchlist_ids:
+            priority = 'high'
+        elif company_id in highvalue_ids:
+            priority = 'medium'
+        else:
+            continue  # no alert for non-priority companies
+
+        catalyst = article.get('catalyst_type')
+        alert_data = {
+            'company_id': company_id,
+            'alert_type': 'news',
+            'priority': priority,
+            'title': f"Wichtige News: {company_name}",
+            'message': title,
+            'condition': json.dumps({
+                'trigger': 'high_relevance_news',
+                'relevance': relevance,
+                'sentiment': article.get('sentiment'),
+                'catalyst_type': catalyst,
+                'source': article.get('source'),
+                'url': article.get('url'),
+            }),
+            'is_active': True,
+            'is_read': False,
+            'triggered_at': datetime.now(timezone.utc).isoformat(),
+            'created_at': datetime.now(timezone.utc).isoformat(),
+        }
+        alerts_to_create.append(alert_data)
+        stats['alerts_created'] += 1
+
+    if not alerts_to_create:
+        return
+
+    print(f"\n  Creating {len(alerts_to_create)} alerts for high-relevance news...")
+
+    if dry_run:
+        for alert in alerts_to_create[:10]:
+            print(f"    [{alert['priority'].upper():6s}] {alert['title']} — {alert['message'][:50]}")
+        if len(alerts_to_create) > 10:
+            print(f"    ... and {len(alerts_to_create) - 10} more")
+        return
+
+    # Insert alerts in batches
+    batch_size = 50
+    inserted = 0
+    for i in range(0, len(alerts_to_create), batch_size):
+        batch = alerts_to_create[i:i + batch_size]
+        try:
+            client.table('alerts').insert(batch).execute()
+            inserted += len(batch)
+        except Exception as e:
+            print(f"    Error inserting alert batch: {e}")
+            # Try one by one
+            for single in batch:
+                try:
+                    client.table('alerts').insert(single).execute()
+                    inserted += 1
+                except Exception as e2:
+                    print(f"      Failed: {single['title'][:40]}... ({e2})")
+
+    print(f"  Alerts inserted: {inserted}")
 
 
 # ---------------------------------------------------------------------------
@@ -851,6 +1014,8 @@ def main():
                         'url': article['url'][:2000],
                         'source': article['source'],
                         'sentiment': None,
+                        'relevance': None,
+                        'industry_match': None,
                         'published_at': article.get('published_at'),
                         'fetched_at': datetime.now(timezone.utc).isoformat(),
                     })
@@ -858,7 +1023,29 @@ def main():
                     # Add to existing URLs to prevent intra-run duplicates
                     existing_urls.add(url_normalized)
             else:
-                stats['rss_unmatched'] += 1
+                # No company match — check for industry-level match
+                industries = match_article_to_industries(
+                    article['title'], article.get('summary', '')
+                )
+                if industries:
+                    # Store with company_id=None but industry_match set
+                    for industry in industries:
+                        news_to_insert.append({
+                            'company_id': None,
+                            'title': article['title'][:500],
+                            'summary': article.get('summary'),
+                            'url': article['url'][:2000],
+                            'source': article['source'],
+                            'sentiment': None,
+                            'relevance': None,
+                            'industry_match': industry,
+                            'published_at': article.get('published_at'),
+                            'fetched_at': datetime.now(timezone.utc).isoformat(),
+                        })
+                        stats['industry_matched'] += 1
+                    existing_urls.add(url_normalized)
+                else:
+                    stats['rss_unmatched'] += 1
 
     # -----------------------------------------------------------------------
     # Phase 2: Brave Search — prioritized with watchlist, rotation, timeouts
@@ -945,6 +1132,8 @@ def main():
                     'url': article['url'][:2000],
                     'source': article['source'],
                     'sentiment': None,
+                    'relevance': None,
+                    'industry_match': None,
                     'published_at': published_at,
                     'fetched_at': datetime.now(timezone.utc).isoformat(),
                 })
@@ -988,6 +1177,21 @@ def main():
         run_sentiment_analysis(news_to_insert, company_map, stats)
 
     # -----------------------------------------------------------------------
+    # Phase 4: Alert creation for high-relevance news
+    # -----------------------------------------------------------------------
+    if news_to_insert and not args.no_sentiment:
+        # Load watchlist and high-value IDs for alert priority
+        print("\n  Phase 4: Alert Creation (relevance >= 4)")
+        print("  " + "-" * 40)
+        watchlist_ids = get_watchlist_company_ids(client)
+        highvalue_ids = get_high_value_company_ids(client)
+        create_news_alerts(
+            news_to_insert, company_map,
+            watchlist_ids, highvalue_ids,
+            client, stats, dry_run
+        )
+
+    # -----------------------------------------------------------------------
     # Summary & Insert
     # -----------------------------------------------------------------------
     print("\n  " + "=" * 50)
@@ -997,6 +1201,7 @@ def main():
     print(f"\n  RSS feeds:")
     print(f"    Articles fetched:    {stats.get('rss_articles_total', 0)}")
     print(f"    Matched to company:  {stats.get('rss_matched', 0)}")
+    print(f"    Industry matched:    {stats.get('industry_matched', 0)}")
     print(f"    Unmatched:           {stats.get('rss_unmatched', 0)}")
     print(f"    Duplicates skipped:  {stats.get('rss_duplicates', 0)}")
 
@@ -1006,9 +1211,12 @@ def main():
     print(f"    Articles found:      {stats.get('brave_matched', 0)}")
     print(f"    Duplicates skipped:  {stats.get('brave_duplicates', 0)}")
 
-    print(f"\n  Sentiment Analysis:")
+    print(f"\n  Sentiment & Relevance:")
     print(f"    Articles analyzed:   {stats.get('sentiment_analyzed', 0)}")
     print(f"    Catalysts detected:  {stats.get('catalyst_detected', 0)}")
+    print(f"    Relevance scored:    {stats.get('relevance_scored', 0)}")
+    print(f"    High relevance (4+): {stats.get('high_relevance', 0)}")
+    print(f"    Alerts created:      {stats.get('alerts_created', 0)}")
 
     print(f"\n  Total new articles:    {len(news_to_insert)}")
 
@@ -1016,12 +1224,16 @@ def main():
     if news_to_insert:
         print(f"\n  Sample articles (first 15):")
         for article in news_to_insert[:15]:
-            cname = company_map.get(article['company_id'], '?')[:30]
+            cid = article.get('company_id')
+            cname = company_map.get(cid, article.get('industry_match') or '?')[:30]
             title = article['title'][:40]
             sent = article.get('sentiment') or '?'
+            rel = article.get('relevance') or '?'
             cat = article.get('catalyst_type') or ''
             cat_str = f" [{cat}]" if cat else ''
-            print(f"    [{article['source'][:15]:15s}] {cname:30s} | {title} ({sent}{cat_str})")
+            ind = article.get('industry_match') or ''
+            ind_str = f" <{ind}>" if ind else ''
+            print(f"    [{article['source'][:15]:15s}] {cname:30s} | {title} ({sent} r:{rel}{cat_str}{ind_str})")
 
     # Insert into Supabase
     if not dry_run and news_to_insert:
