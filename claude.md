@@ -2,13 +2,13 @@
 
 **Status:** Production Ready - Deployed auf Hostinger VPS
 **Datum:** 13. März 2026
-**Version:** 3.2 (Data Quality Phase 1 + JSONB Columns + Auth + Sentry)
+**Version:** 3.3 (Phase 2 News-Automatisierung deployed)
 
 ---
 
 ## Übersicht
 
-3 automatisierte Workflows laufen 24/7 auf Hostinger VPS:
+6 automatisierte Workflows laufen 24/7 auf Hostinger VPS:
 
 ### 1. Passive Income Generator (06:00 MEZ)
 - **Repo:** https://github.com/rseckler/Passive-Income-Generator
@@ -29,6 +29,27 @@
 - **Funktion:** Live Aktienkurse via yfinance -> Supabase (~300-400 Updates/h)
 - **Status:** Aktiv
 
+### 4. News Collector (alle 2 Stunden)
+- **Repo:** https://github.com/rseckler/Blackfire_automation
+- **Path:** `/root/Blackfire_automation`
+- **Funktion:** RSS-Feeds (5 Quellen) + Brave Search → company_news Tabelle
+- **Output:** 39+ Artikel/Run, Duplikat-Erkennung via URL
+- **Status:** Aktiv
+
+### 5. IPO Tracker (täglich 07:00 UTC)
+- **Repo:** https://github.com/rseckler/Blackfire_automation
+- **Path:** `/root/Blackfire_automation`
+- **Funktion:** Finnhub (90 IPOs) + Nasdaq + Brave Search → company_events (event_type: 'ipo')
+- **Matching:** Fuzzy-Matching gegen 518 Private/Pre-IPO Companies (70% Threshold)
+- **Status:** Aktiv
+
+### 6. Earnings Calendar (wöchentlich Sonntag 06:00 UTC)
+- **Repo:** https://github.com/rseckler/Blackfire_automation
+- **Path:** `/root/Blackfire_automation`
+- **Funktion:** yfinance Earnings-Termine → company_events (event_type: 'earnings')
+- **Scope:** ~1193 Public Companies mit gültigem Symbol → 399 Termine
+- **Status:** Aktiv
+
 ---
 
 ## Datenbank: Supabase (PostgreSQL)
@@ -40,9 +61,13 @@
 
 | Tabelle | Zweck |
 |---------|-------|
-| `companies` | Haupttabelle (~1644 Aktien), Core-Felder + `extra_data` JSONB |
+| `companies` | Haupttabelle (~1732 Aktien), Core-Felder + `extra_data` JSONB |
 | `sync_history` | Automatisches Logging aller Sync/Update-Runs |
 | `stock_prices` | Historische Kursdaten (von Blackfire_service) |
+| `company_news` | Automatisch gesammelte News (news_collector.py) |
+| `company_events` | IPO-Termine + Earnings-Termine (ipo_tracker.py, earnings_calendar.py) |
+| `company_scores` | Blackfire Score Historie (Phase 3, noch nicht befüllt) |
+| `alerts` | Automatische Alerts (Phase 3, noch nicht befüllt) |
 
 ### Companies Schema (relevante Felder)
 
@@ -110,9 +135,15 @@ Alle Scripts nutzen dieses Modul für Supabase-Zugriff:
 │   ├── fix_tickers.py             # Ticker-Korrektur via OpenFIGI (manuell --apply)
 │   ├── extract_sources.py         # Source-Extraktion Utility
 │   ├── promote_jsonb_fields.py    # JSONB→Real Columns Migration
+│   ├── news_collector.py          # RSS + Brave Search News-Sammlung (alle 2h)
+│   ├── ipo_tracker.py             # IPO-Kalender Finnhub+Nasdaq+Brave (täglich)
+│   ├── earnings_calendar.py       # Earnings-Termine via yfinance (wöchentlich)
 │   ├── invalid_companies.json     # Blacklist (Supabase UUIDs, TTL 30d)
 │   ├── sync_cron.log
-│   └── stock_prices.log
+│   ├── stock_prices.log
+│   ├── news.log                   # News Collector Output
+│   ├── ipo.log                    # IPO Tracker Output
+│   └── earnings.log               # Earnings Calendar Output
 │
 └── Passive-Income-Generator/
     ├── venv/
@@ -134,6 +165,15 @@ Alle Scripts nutzen dieses Modul für Supabase-Zugriff:
 
 # Blackfire Stock Updates (07-23 UTC = 08-00 MEZ, stündlich)
 0 7-23 * * * /root/Blackfire_automation/venv/bin/python3 /root/Blackfire_automation/stock_price_updater.py >> /root/Blackfire_automation/stock_prices.log 2>&1
+
+# News Collector (alle 2 Stunden)
+0 */2 * * * /root/Blackfire_automation/venv/bin/python3 /root/Blackfire_automation/news_collector.py --apply >> /root/Blackfire_automation/news.log 2>&1
+
+# IPO Tracker (täglich 07:00 UTC)
+0 7 * * * /root/Blackfire_automation/venv/bin/python3 /root/Blackfire_automation/ipo_tracker.py --apply >> /root/Blackfire_automation/ipo.log 2>&1
+
+# Earnings Calendar (wöchentlich Sonntag 06:00 UTC)
+0 6 * * 0 /root/Blackfire_automation/venv/bin/python3 /root/Blackfire_automation/earnings_calendar.py --apply >> /root/Blackfire_automation/earnings.log 2>&1
 ```
 
 ---
@@ -158,8 +198,9 @@ ALERT_EMAIL_TO=...@gmail.com
 # AI Data Enrichment (Claude)
 ANTHROPIC_API_KEY=...  # Für ai_data_enrichment.py, classify_listing_status.py, fix_tickers.py
 
-# Optional
-BRAVE_API_KEY=...
+# News & IPO Tracking
+BRAVE_API_KEY=...        # Für news_collector.py, ipo_tracker.py
+FINNHUB_API_KEY=...      # Für ipo_tracker.py (finnhub.io Free Tier)
 ```
 
 Notion-Credentials werden nicht mehr benötigt (Migration abgeschlossen).
@@ -237,6 +278,9 @@ ssh root@72.62.148.205
 ```bash
 tail -f ~/Blackfire_automation/sync_cron.log
 tail -f ~/Blackfire_automation/stock_prices.log
+tail -f ~/Blackfire_automation/news.log
+tail -f ~/Blackfire_automation/ipo.log
+tail -f ~/Blackfire_automation/earnings.log
 tail -f ~/Passive-Income-Generator/cron.log
 ```
 
@@ -316,6 +360,19 @@ git pull
 ---
 
 ## Deployment Changelog
+
+### 13. März 2026 - Phase 2 News-Automatisierung (v3.3)
+- **3 neue Scripts deployed:**
+  - `news_collector.py`: RSS-Feeds (TechCrunch, Reuters, Yahoo Finance, MarketWatch, Seeking Alpha) + Brave Search API für company-spezifische News. Company-Matching by Symbol + Name. Duplikat-Erkennung via URL. 39+ Artikel/Run.
+  - `ipo_tracker.py`: Multi-Source IPO-Tracking (Finnhub API: 90 IPOs, Nasdaq Calendar, Brave Search Fallback). Fuzzy-Matching (difflib, 70% Threshold) gegen 518 Private/Pre-IPO Companies.
+  - `earnings_calendar.py`: yfinance Earnings-Termine für ~1193 Public Companies. 399 Termine gefunden. Respektiert invalid_companies.json Blacklist. Rate-Limiting: 1s/Request.
+- **3 neue Cronjobs auf VPS:**
+  - News Collector: alle 2 Stunden mit --apply
+  - IPO Tracker: täglich 07:00 UTC mit --apply
+  - Earnings Calendar: wöchentlich Sonntag 06:00 UTC mit --apply
+- **Neue Credentials auf VPS:** FINNHUB_API_KEY, BRAVE_API_KEY
+- **Dependencies:** `feedparser>=6.0.0` hinzugefügt
+- **Linear Issues:** RSE-170, RSE-174–177 → Done
 
 ### 13. März 2026 - Data Quality Phase 1 & Full Hardening (v3.2)
 - **Data Quality Scripts (VPS deployed):**
@@ -427,5 +484,11 @@ git pull
 - [x] Morning Sync erweitert (normalize + classify integriert)
 - [x] Google OAuth (Blackfire_service)
 - [x] Sentry Error Tracking (Blackfire_service)
+- [x] news_collector.py deployed (RSS + Brave Search, alle 2h)
+- [x] ipo_tracker.py deployed (Finnhub + Nasdaq + Brave, täglich 07:00)
+- [x] earnings_calendar.py deployed (yfinance, wöchentlich So 06:00)
+- [x] FINNHUB_API_KEY + BRAVE_API_KEY auf VPS konfiguriert
+- [x] Phase 2 Cronjobs eingerichtet
+- [x] Linear Issues RSE-170, RSE-174–177 → Done
 
-**Status:** All Systems Operational - VPS Production Deployed (v3.2)
+**Status:** All Systems Operational - VPS Production Deployed (v3.3)

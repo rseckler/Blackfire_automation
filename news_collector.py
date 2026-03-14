@@ -4,7 +4,9 @@ News Collector — Fetches news for companies from RSS feeds and Brave Search AP
 matches articles to companies, and stores in company_news table.
 
 Sources:
-  - RSS feeds (TechCrunch, Reuters, Yahoo Finance, MarketWatch, Seeking Alpha)
+  - RSS feeds (17 feeds: TechCrunch, Reuters, Yahoo Finance, MarketWatch, Seeking Alpha,
+    Benzinga, CNBC, Bloomberg, FT, Barron's, CoinDesk, PR Newswire, GlobeNewsWire,
+    VentureBeat, The Verge, Ars Technica, Hacker News)
   - Brave Search API (company-specific news search)
 
 Usage:
@@ -13,11 +15,16 @@ Usage:
   python3 news_collector.py --apply --limit 50  # limit to first 50 companies
   python3 news_collector.py --brave-only     # skip RSS, only Brave Search
   python3 news_collector.py --rss-only       # skip Brave, only RSS feeds
+  python3 news_collector.py --no-sentiment   # skip sentiment analysis (faster)
+  python3 news_collector.py --backfill-sentiment  # backfill sentiment on existing articles
 """
 
 import argparse
+import atexit
+import json
 import os
 import re
+import signal
 import sys
 import time
 import hashlib
@@ -38,6 +45,13 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install feedparser")
     import feedparser
 
+try:
+    from anthropic import Anthropic
+except ImportError:
+    print("Installing anthropic...")
+    os.system(f"{sys.executable} -m pip install anthropic")
+    from anthropic import Anthropic
+
 import supabase_helper
 
 # ---------------------------------------------------------------------------
@@ -45,23 +59,48 @@ import supabase_helper
 # ---------------------------------------------------------------------------
 
 RSS_FEEDS = [
+    # --- Original 5 ---
     {"name": "TechCrunch", "url": "https://techcrunch.com/feed/"},
     {"name": "Reuters", "url": "https://www.reutersagency.com/feed/"},
     {"name": "Yahoo Finance", "url": "https://finance.yahoo.com/news/rssindex"},
     {"name": "MarketWatch", "url": "https://feeds.marketwatch.com/marketwatch/topstories/"},
     {"name": "Seeking Alpha", "url": "https://seekingalpha.com/market_currents.xml"},
+    # --- Financial news ---
+    {"name": "Benzinga", "url": "https://www.benzinga.com/feed"},
+    {"name": "CNBC Tech", "url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=19854910"},
+    {"name": "Bloomberg Markets", "url": "https://feeds.bloomberg.com/markets/news.rss"},
+    {"name": "Financial Times", "url": "https://www.ft.com/rss/home"},
+    {"name": "Barron's", "url": "https://www.barrons.com/market-data/rss"},
+    {"name": "CoinDesk", "url": "https://www.coindesk.com/arc/outboundfeeds/rss/"},
+    # --- Press releases ---
+    {"name": "PR Newswire", "url": "https://www.prnewswire.com/rss/news-releases-list.rss"},
+    {"name": "GlobeNewsWire", "url": "https://www.globenewswire.com/RssFeed/subjectcode/01-Business%20and%20Financial/feedTitle/GlobeNewswire%20-%20News%20Releases"},
+    # --- Tech news ---
+    {"name": "VentureBeat", "url": "https://venturebeat.com/feed/"},
+    {"name": "The Verge", "url": "https://www.theverge.com/rss/index.xml"},
+    {"name": "Ars Technica", "url": "https://feeds.arstechnica.com/arstechnica/index"},
+    {"name": "Hacker News", "url": "https://hnrss.org/newest?points=100"},
 ]
 
 # Brave Search API config
 BRAVE_API_KEY = os.getenv('BRAVE_API_KEY', '')
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/news/search"
-BRAVE_RATE_LIMIT_DELAY = 1.0  # seconds between requests (1 req/s free tier)
+BRAVE_RATE_LIMIT_DELAY = 1.1  # seconds between requests (1 req/s free tier + margin)
 BRAVE_BATCH_SIZE = 20  # companies per batch before pause
 BRAVE_BATCH_PAUSE = 5.0  # seconds between batches
+BRAVE_MAX_CONSECUTIVE_429 = 3  # stop Brave after this many consecutive 429s
+BRAVE_BACKOFF_STEPS = [5, 15, 30]  # exponential backoff seconds on 429
+BRAVE_MAX_RUNTIME_MINUTES = 90  # stop Brave Search after this many minutes
+BRAVE_ROTATION_GROUPS = 7  # divide remaining companies into 7 daily groups (one per weekday)
 
 # RSS config
 RSS_TIMEOUT = 15  # seconds per feed fetch
-RSS_MAX_ENTRIES = 100  # max entries per feed
+RSS_MAX_ENTRIES = 30  # max entries per feed
+
+# Sentiment analysis config
+SENTIMENT_BATCH_SIZE = 10  # articles per API call
+SENTIMENT_RATE_LIMIT_DELAY = 1.0  # seconds between API calls
+ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY', '')
 
 # Minimum company name length for matching (avoid false positives)
 MIN_NAME_LENGTH = 3
@@ -74,6 +113,65 @@ GENERIC_WORDS = {
     'global', 'digital', 'media', 'energy', 'bio', 'pharma', 'financial',
     'one', 'two', 'new', 'first', 'next', 'best', 'top', 'pro', 'air',
 }
+
+
+# ---------------------------------------------------------------------------
+# PID lock — prevent multiple instances running simultaneously
+# ---------------------------------------------------------------------------
+
+PID_FILE = '/tmp/news_collector.pid'
+
+
+def _is_process_running(pid: int) -> bool:
+    """Check if a process with given PID is still running."""
+    try:
+        os.kill(pid, 0)  # signal 0 = check existence, no actual signal sent
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def acquire_pid_lock():
+    """Acquire PID lock. Exits if another instance is already running."""
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE, 'r') as f:
+                old_pid = int(f.read().strip())
+            if _is_process_running(old_pid):
+                print(f"  Another instance is already running (PID {old_pid}). Exiting.")
+                sys.exit(0)
+            else:
+                print(f"  Stale PID file found (PID {old_pid} not running). Removing.")
+                os.remove(PID_FILE)
+        except (ValueError, IOError):
+            os.remove(PID_FILE)
+
+    # Write our PID
+    with open(PID_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+
+    # Register cleanup on normal exit
+    atexit.register(_remove_pid_lock)
+
+    # Register cleanup on SIGTERM/SIGINT
+    def _signal_handler(signum, frame):
+        _remove_pid_lock()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
+
+def _remove_pid_lock():
+    """Remove PID file on exit."""
+    try:
+        if os.path.exists(PID_FILE):
+            with open(PID_FILE, 'r') as f:
+                pid = int(f.read().strip())
+            if pid == os.getpid():
+                os.remove(PID_FILE)
+    except (ValueError, IOError, OSError):
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -253,13 +351,15 @@ def fetch_rss_feeds() -> list:
 # Brave Search collection
 # ---------------------------------------------------------------------------
 
-def search_brave_news(company_name: str, symbol: str = None) -> list:
+def search_brave_news(company_name: str, symbol: str = None,
+                      consecutive_429_count: int = 0) -> tuple:
     """Search Brave News API for a specific company.
 
-    Returns list of article dicts.
+    Returns tuple of (articles_list, was_429: bool).
+    The caller uses was_429 to track consecutive rate limits.
     """
     if not BRAVE_API_KEY:
-        return []
+        return [], False
 
     # Build search query
     query = f'"{company_name}" stock'
@@ -280,14 +380,21 @@ def search_brave_news(company_name: str, symbol: str = None) -> list:
 
     try:
         resp = requests.get(BRAVE_SEARCH_URL, headers=headers, params=params, timeout=10)
+
         if resp.status_code == 429:
-            print(f"      Rate limited, waiting 60s...")
-            time.sleep(60)
+            # Exponential backoff: pick delay based on how many consecutive 429s
+            backoff_idx = min(consecutive_429_count, len(BRAVE_BACKOFF_STEPS) - 1)
+            backoff_secs = BRAVE_BACKOFF_STEPS[backoff_idx]
+            print(f"      Rate limited (429), backoff {backoff_secs}s (consecutive: {consecutive_429_count + 1})")
+            time.sleep(backoff_secs)
+            # Retry once after backoff
             resp = requests.get(BRAVE_SEARCH_URL, headers=headers, params=params, timeout=10)
+            if resp.status_code == 429:
+                return [], True  # still rate limited
 
         if resp.status_code != 200:
             print(f"      Brave API error {resp.status_code} for {company_name}")
-            return []
+            return [], False
 
         data = resp.json()
         results = data.get('results', [])
@@ -306,11 +413,109 @@ def search_brave_news(company_name: str, symbol: str = None) -> list:
                 'published_at': r.get('age') or r.get('page_age') or None,
             })
 
-        return articles
+        return articles, False
 
     except Exception as e:
         print(f"      Brave error for {company_name}: {e}")
-        return []
+        return [], False
+
+
+def get_watchlist_company_ids(client) -> set:
+    """Fetch all company_ids from the watchlist table."""
+    ids = set()
+    page_size = 1000
+    offset = 0
+    while True:
+        response = client.table('watchlist') \
+            .select('company_id') \
+            .range(offset, offset + page_size - 1) \
+            .execute()
+        batch = response.data
+        for row in batch:
+            cid = row.get('company_id')
+            if cid:
+                ids.add(cid)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    return ids
+
+
+def get_high_value_company_ids(client) -> set:
+    """Fetch company_ids that are high-value: thier_group top tiers, VIP Defcon 1, or prio_buy <= 2."""
+    ids = set()
+
+    # thier_group IN ('2026***', '2026**')
+    for tg in ['2026***', '2026**']:
+        response = client.table('companies') \
+            .select('id') \
+            .eq('thier_group', tg) \
+            .execute()
+        for row in response.data:
+            ids.add(row['id'])
+
+    # vip = 'Defcon 1'
+    response = client.table('companies') \
+        .select('id') \
+        .eq('vip', 'Defcon 1') \
+        .execute()
+    for row in response.data:
+        ids.add(row['id'])
+
+    # prio_buy <= 2 (1 or 2)
+    for pb in [1, 2]:
+        response = client.table('companies') \
+            .select('id') \
+            .eq('prio_buy', pb) \
+            .execute()
+        for row in response.data:
+            ids.add(row['id'])
+
+    return ids
+
+
+def build_brave_search_list(priority_companies: list, client, limit: int = 0) -> tuple:
+    """Build ordered list of companies for Brave Search.
+
+    Returns (always_search_list, rotation_list) where:
+      - always_search_list: watchlist + high-value companies (searched every run)
+      - rotation_list: today's rotation slice of remaining public companies
+    """
+    # Get high-priority company IDs
+    watchlist_ids = get_watchlist_company_ids(client)
+    highvalue_ids = get_high_value_company_ids(client)
+    always_ids = watchlist_ids | highvalue_ids
+
+    # Split priority_companies into always-search and rest
+    always_search = []
+    rest = []
+    for c in priority_companies:
+        if c['id'] in always_ids:
+            always_search.append(c)
+        else:
+            rest.append(c)
+
+    # Daily rotation: pick today's slice of the rest
+    day_of_year = datetime.now().timetuple().tm_yday
+    group_index = day_of_year % BRAVE_ROTATION_GROUPS
+    group_size = max(1, len(rest) // BRAVE_ROTATION_GROUPS)
+    start = group_index * group_size
+    # Last group gets any remainder
+    if group_index == BRAVE_ROTATION_GROUPS - 1:
+        rotation_slice = rest[start:]
+    else:
+        rotation_slice = rest[start:start + group_size]
+
+    # Apply --limit if set (applies to total, always_search first)
+    if limit > 0:
+        if len(always_search) >= limit:
+            always_search = always_search[:limit]
+            rotation_slice = []
+        else:
+            remaining = limit - len(always_search)
+            rotation_slice = rotation_slice[:remaining]
+
+    return always_search, rotation_slice
 
 
 # ---------------------------------------------------------------------------
@@ -351,16 +556,220 @@ def normalize_url(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Sentiment Analysis (Claude Haiku)
+# ---------------------------------------------------------------------------
+
+def _build_sentiment_prompt(articles: list, company_map: dict) -> str:
+    """Build prompt for Claude Haiku sentiment analysis."""
+    articles_text = []
+    for i, article in enumerate(articles):
+        company_name = company_map.get(article.get('company_id', ''), 'Unknown')
+        summary = article.get('summary') or 'No summary'
+        articles_text.append(
+            f'{i+1}. "{article["title"]}" about {company_name} - {summary}'
+        )
+
+    return f"""Analyze the sentiment of these news articles about companies. For each article, return:
+- index: article number (1-based)
+- sentiment: "positive", "negative", or "neutral"
+- catalyst_type: if this is a potential catalyst, what type? (earnings, fda, partnership, ipo, acquisition, product_launch, regulatory, leadership, funding, null)
+
+Articles:
+{chr(10).join(articles_text)}
+
+Return ONLY a JSON array."""
+
+
+def analyze_sentiment_batch(articles: list, anthropic_client: Anthropic, company_map: dict) -> list:
+    """Analyze sentiment for a batch of articles using Claude Haiku.
+
+    Args:
+        articles: list of article dicts (must have title, summary, company_id)
+        anthropic_client: Anthropic API client
+        company_map: {company_id: company_name} mapping
+
+    Returns:
+        list of dicts with index, sentiment, catalyst_type
+    """
+    prompt = _build_sentiment_prompt(articles, company_map)
+
+    try:
+        response = anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = response.content[0].text.strip()
+
+        # Extract JSON from response (handle markdown code blocks)
+        if text.startswith('```'):
+            text = text.split('\n', 1)[1]
+            text = text.rsplit('```', 1)[0]
+
+        results = json.loads(text)
+        return results
+
+    except json.JSONDecodeError as e:
+        print(f"    JSON parse error in sentiment analysis: {e}")
+        return []
+    except Exception as e:
+        print(f"    Sentiment API error: {e}")
+        return []
+
+
+def run_sentiment_analysis(news_to_insert: list, company_map: dict, stats: Counter):
+    """Run sentiment analysis on all articles to be inserted.
+
+    Modifies articles in-place, setting 'sentiment' and 'catalyst_type' fields.
+    """
+    if not ANTHROPIC_API_KEY:
+        print("\n  Sentiment: SKIPPED (no ANTHROPIC_API_KEY in .env)")
+        return
+
+    anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    batches = [news_to_insert[i:i + SENTIMENT_BATCH_SIZE]
+               for i in range(0, len(news_to_insert), SENTIMENT_BATCH_SIZE)]
+
+    print(f"\n  Phase 3: Sentiment Analysis (Claude Haiku)")
+    print("  " + "-" * 40)
+    print(f"  Analyzing {len(news_to_insert)} articles in {len(batches)} batches...")
+
+    for batch_idx, batch in enumerate(batches):
+        results = analyze_sentiment_batch(batch, anthropic_client, company_map)
+
+        if results:
+            for result in results:
+                idx = result.get('index', 0) - 1
+                if 0 <= idx < len(batch):
+                    sentiment = result.get('sentiment', '').lower()
+                    if sentiment in ('positive', 'negative', 'neutral'):
+                        batch[idx]['sentiment'] = sentiment
+                        stats['sentiment_analyzed'] += 1
+
+                    catalyst = result.get('catalyst_type')
+                    if catalyst and str(catalyst).lower() not in ('null', 'none', ''):
+                        batch[idx]['catalyst_type'] = str(catalyst).lower()
+                        stats['catalyst_detected'] += 1
+
+        if (batch_idx + 1) % 10 == 0 or batch_idx == len(batches) - 1:
+            print(f"    ... {batch_idx + 1}/{len(batches)} batches done "
+                  f"({stats.get('sentiment_analyzed', 0)} analyzed, "
+                  f"{stats.get('catalyst_detected', 0)} catalysts)")
+
+        time.sleep(SENTIMENT_RATE_LIMIT_DELAY)
+
+
+def backfill_sentiment():
+    """Backfill sentiment on existing articles where sentiment IS NULL."""
+    if not ANTHROPIC_API_KEY:
+        print("\n  ERROR: ANTHROPIC_API_KEY not set in .env")
+        sys.exit(1)
+
+    client = supabase_helper.get_client()
+    anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    # Load company names for the prompt
+    companies = supabase_helper.get_all_companies('id, name')
+    company_map = {c['id']: c.get('name', '?') for c in companies}
+
+    # Fetch articles without sentiment
+    print("\n  Loading articles without sentiment...")
+    articles = []
+    page_size = 1000
+    offset = 0
+
+    while True:
+        response = client.table('company_news') \
+            .select('id, company_id, title, summary') \
+            .is_('sentiment', 'null') \
+            .range(offset, offset + page_size - 1) \
+            .execute()
+        batch = response.data
+        articles.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+
+    if not articles:
+        print("  No articles need sentiment backfill.")
+        return
+
+    print(f"  Found {len(articles)} articles without sentiment.")
+
+    batches = [articles[i:i + SENTIMENT_BATCH_SIZE]
+               for i in range(0, len(articles), SENTIMENT_BATCH_SIZE)]
+    est_cost = len(batches) * 0.001
+    print(f"  Estimated cost: ~${est_cost:.2f} ({len(batches)} batches x ~$0.001)")
+    print(f"  Processing...")
+
+    total_updated = 0
+    total_catalysts = 0
+
+    for batch_idx, batch in enumerate(batches):
+        results = analyze_sentiment_batch(batch, anthropic_client, company_map)
+
+        if results:
+            for result in results:
+                idx = result.get('index', 0) - 1
+                if 0 <= idx < len(batch):
+                    article = batch[idx]
+                    update_data = {}
+
+                    sentiment = result.get('sentiment', '').lower()
+                    if sentiment in ('positive', 'negative', 'neutral'):
+                        update_data['sentiment'] = sentiment
+
+                    catalyst = result.get('catalyst_type')
+                    if catalyst and str(catalyst).lower() not in ('null', 'none', ''):
+                        update_data['catalyst_type'] = str(catalyst).lower()
+                        total_catalysts += 1
+
+                    if update_data:
+                        try:
+                            client.table('company_news') \
+                                .update(update_data) \
+                                .eq('id', article['id']) \
+                                .execute()
+                            total_updated += 1
+                        except Exception as e:
+                            print(f"    Error updating {article['id']}: {e}")
+
+        if (batch_idx + 1) % 10 == 0 or batch_idx == len(batches) - 1:
+            print(f"    ... {batch_idx + 1}/{len(batches)} batches done "
+                  f"({total_updated} updated, {total_catalysts} catalysts)")
+
+        time.sleep(SENTIMENT_RATE_LIMIT_DELAY)
+
+    print(f"\n  Backfill complete: {total_updated} articles updated, "
+          f"{total_catalysts} catalysts detected.")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
+    # Acquire PID lock to prevent multiple instances
+    acquire_pid_lock()
+
     parser = argparse.ArgumentParser(description='Collect news for companies')
     parser.add_argument('--apply', action='store_true', help='Insert results into Supabase')
     parser.add_argument('--limit', type=int, default=0, help='Limit number of companies for Brave Search')
     parser.add_argument('--brave-only', action='store_true', help='Skip RSS, only use Brave Search')
     parser.add_argument('--rss-only', action='store_true', help='Skip Brave, only use RSS feeds')
+    parser.add_argument('--no-sentiment', action='store_true', help='Skip sentiment analysis (faster runs)')
+    parser.add_argument('--backfill-sentiment', action='store_true', help='Backfill sentiment on existing articles')
     args = parser.parse_args()
+
+    # Handle backfill mode separately
+    if args.backfill_sentiment:
+        print("\n" + "=" * 70)
+        print("  NEWS COLLECTOR — SENTIMENT BACKFILL")
+        print(f"  Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 70)
+        backfill_sentiment()
+        print("\n  Done!")
+        return
 
     dry_run = not args.apply
     start_time = datetime.now()
@@ -375,11 +784,13 @@ def main():
         print("  Source: RSS feeds only")
     else:
         print("  Source: RSS feeds + Brave Search")
+    if args.no_sentiment:
+        print("  Sentiment: DISABLED (--no-sentiment)")
     print("=" * 70)
 
     # Load companies (prioritize public and pre_ipo)
     print("\n  Loading companies...")
-    companies = supabase_helper.get_all_companies('id, name, symbol, listing_status')
+    companies = supabase_helper.get_all_companies('id, name, symbol, listing_status, thier_group, vip, prio_buy')
     total_companies = len(companies)
 
     # Filter to public/pre_ipo first
@@ -450,27 +861,66 @@ def main():
                 stats['rss_unmatched'] += 1
 
     # -----------------------------------------------------------------------
-    # Phase 2: Brave Search — targeted search for priority companies
+    # Phase 2: Brave Search — prioritized with watchlist, rotation, timeouts
     # -----------------------------------------------------------------------
     if not args.rss_only and BRAVE_API_KEY:
-        print("\n  Phase 2: Brave Search (targeted)")
+        print("\n  Phase 2: Brave Search (prioritized)")
         print("  " + "-" * 40)
 
-        # Use priority companies for Brave Search
-        brave_companies = priority_companies
-        if args.limit > 0:
-            brave_companies = brave_companies[:args.limit]
+        # Build prioritized search list
+        print("  Loading watchlist and high-value company IDs...")
+        always_search, rotation_slice = build_brave_search_list(
+            priority_companies, client, args.limit
+        )
+        day_of_year = datetime.now().timetuple().tm_yday
+        group_index = day_of_year % BRAVE_ROTATION_GROUPS
 
-        print(f"  Searching for {len(brave_companies)} companies...")
+        print(f"  Always-search (watchlist + high-value): {len(always_search)}")
+        print(f"  Rotation group {group_index + 1}/{BRAVE_ROTATION_GROUPS}: {len(rotation_slice)}")
+        total_brave = len(always_search) + len(rotation_slice)
+        print(f"  Total to search this run: {total_brave}")
 
-        for i, company in enumerate(brave_companies):
+        # Track rate limit state
+        consecutive_429 = 0
+        brave_stopped_reason = None
+        brave_start_time = time.time()
+        brave_deadline = brave_start_time + BRAVE_MAX_RUNTIME_MINUTES * 60
+
+        # Process both lists in order: always_search first, then rotation
+        all_brave_companies = []
+        for c in always_search:
+            all_brave_companies.append((c, 'priority'))
+        for c in rotation_slice:
+            all_brave_companies.append((c, 'rotation'))
+
+        for i, (company, tier) in enumerate(all_brave_companies):
+            # Check max runtime
+            if time.time() > brave_deadline:
+                brave_stopped_reason = f"max runtime ({BRAVE_MAX_RUNTIME_MINUTES} min)"
+                print(f"\n    STOPPING: {brave_stopped_reason}")
+                break
+
+            # Check consecutive 429 limit
+            if consecutive_429 >= BRAVE_MAX_CONSECUTIVE_429:
+                brave_stopped_reason = f"{BRAVE_MAX_CONSECUTIVE_429} consecutive 429s"
+                print(f"\n    STOPPING: {brave_stopped_reason}")
+                break
+
             name = (company.get('name') or '').strip()
             symbol = (company.get('symbol') or '').strip()
 
             if not name:
                 continue
 
-            articles = search_brave_news(name, symbol)
+            articles, was_429 = search_brave_news(name, symbol, consecutive_429)
+
+            if was_429:
+                consecutive_429 += 1
+                stats['brave_429s'] += 1
+                continue
+            else:
+                consecutive_429 = 0  # reset on success
+
             stats['brave_searches'] += 1
 
             for article in articles:
@@ -503,17 +953,39 @@ def main():
 
             # Rate limiting
             if (i + 1) % BRAVE_BATCH_SIZE == 0:
-                print(f"    ... {i + 1}/{len(brave_companies)} companies searched, pausing {BRAVE_BATCH_PAUSE}s...")
+                elapsed_min = (time.time() - brave_start_time) / 60
+                print(f"    ... {i + 1}/{total_brave} searched ({tier}), "
+                      f"{stats['brave_searches']} ok / {stats.get('brave_429s', 0)} 429s, "
+                      f"{elapsed_min:.1f} min elapsed, pausing {BRAVE_BATCH_PAUSE}s...")
                 time.sleep(BRAVE_BATCH_PAUSE)
             else:
                 time.sleep(BRAVE_RATE_LIMIT_DELAY)
 
-            # Progress
+            # Progress every 50
             if (i + 1) % 50 == 0:
-                print(f"    ... {i + 1}/{len(brave_companies)} companies searched")
+                elapsed_min = (time.time() - brave_start_time) / 60
+                print(f"    ... {i + 1}/{total_brave} searched, "
+                      f"{stats['brave_searches']} ok / {stats.get('brave_429s', 0)} 429s, "
+                      f"{elapsed_min:.1f} min elapsed")
+
+        # Final Brave stats
+        brave_elapsed = (time.time() - brave_start_time) / 60
+        success_rate = (stats['brave_searches'] / max(1, stats['brave_searches'] + stats.get('brave_429s', 0))) * 100
+        print(f"\n  Brave Search completed in {brave_elapsed:.1f} min")
+        print(f"  Success rate: {success_rate:.0f}% ({stats['brave_searches']} ok / {stats.get('brave_429s', 0)} rate-limited)")
+        if brave_stopped_reason:
+            print(f"  Stopped early: {brave_stopped_reason}")
 
     elif not args.rss_only and not BRAVE_API_KEY:
         print("\n  Phase 2: SKIPPED (no BRAVE_API_KEY in .env)")
+
+    # -----------------------------------------------------------------------
+    # Phase 3: Sentiment Analysis — analyze new articles before insert
+    # -----------------------------------------------------------------------
+    company_map = {c['id']: c.get('name', '?') for c in companies}
+
+    if news_to_insert and not args.no_sentiment:
+        run_sentiment_analysis(news_to_insert, company_map, stats)
 
     # -----------------------------------------------------------------------
     # Summary & Insert
@@ -530,20 +1002,26 @@ def main():
 
     print(f"\n  Brave Search:")
     print(f"    Companies searched:  {stats.get('brave_searches', 0)}")
+    print(f"    Rate limited (429):  {stats.get('brave_429s', 0)}")
     print(f"    Articles found:      {stats.get('brave_matched', 0)}")
     print(f"    Duplicates skipped:  {stats.get('brave_duplicates', 0)}")
+
+    print(f"\n  Sentiment Analysis:")
+    print(f"    Articles analyzed:   {stats.get('sentiment_analyzed', 0)}")
+    print(f"    Catalysts detected:  {stats.get('catalyst_detected', 0)}")
 
     print(f"\n  Total new articles:    {len(news_to_insert)}")
 
     # Show sample articles
     if news_to_insert:
         print(f"\n  Sample articles (first 15):")
-        # Find company names for display
-        company_map = {c['id']: c.get('name', '?') for c in companies}
         for article in news_to_insert[:15]:
             cname = company_map.get(article['company_id'], '?')[:30]
-            title = article['title'][:50]
-            print(f"    [{article['source'][:15]:15s}] {cname:30s} | {title}")
+            title = article['title'][:40]
+            sent = article.get('sentiment') or '?'
+            cat = article.get('catalyst_type') or ''
+            cat_str = f" [{cat}]" if cat else ''
+            print(f"    [{article['source'][:15]:15s}] {cname:30s} | {title} ({sent}{cat_str})")
 
     # Insert into Supabase
     if not dry_run and news_to_insert:

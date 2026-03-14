@@ -32,7 +32,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install anthropic")
     from anthropic import Anthropic
 
-MODEL = "claude-sonnet-4-5-20251022"
+MODEL = "claude-sonnet-4-20250514"
 
 
 def collect_data(client) -> dict:
@@ -131,7 +131,7 @@ def build_prompt(data: dict) -> str:
         for n in data['news']:
             c = companies.get(n.get('company_id'), {})
             name = c.get('name', '?')
-            sentiment = n.get('sentiment', 'neutral')
+            sentiment = n.get('sentiment') or 'neutral'
             news_lines.append(
                 f"- [{sentiment.upper()}] {n.get('title', '?')} — {name}\n"
                 f"  Quelle: {n.get('source', '?')}"
