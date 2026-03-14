@@ -322,43 +322,55 @@ def main():
 
     # Apply
     if args.apply:
-        print(f"\n  Writing {len(results)} scores to company_scores...")
+        print(f"\n  Clearing old scores...")
+        try:
+            client.table('company_scores').delete().neq('id', '00000000-0000-0000-0000-000000000000').execute()
+            print(f"  Old scores cleared")
+        except Exception as e:
+            print(f"  Warning: Could not clear old scores: {e}")
+
+        print(f"  Writing {len(results)} scores to company_scores...")
+        now = datetime.now().isoformat()
         success = 0
         errors = 0
 
+        # Batch insert in chunks of 50
+        batch = []
         for i, r in enumerate(results):
-            # Write overall score
-            try:
-                client.table('company_scores').upsert({
-                    'company_id': r['company_id'],
-                    'score_type': 'overall',
-                    'score_value': r['overall'],
-                    'details': r['components'],
-                    'computed_at': datetime.now().isoformat(),
-                }, on_conflict='company_id,score_type').execute()
-                success += 1
-            except Exception as e:
-                errors += 1
-                if errors <= 5:
-                    print(f"    Error for {r['name']}: {e}")
+            # Overall score
+            batch.append({
+                'company_id': r['company_id'],
+                'score_type': 'overall',
+                'score_value': r['overall'],
+                'details': r['components'],
+                'computed_at': now,
+            })
 
-            # Write component scores
+            # Component scores
             for comp_name, comp_value in r['components'].items():
+                batch.append({
+                    'company_id': r['company_id'],
+                    'score_type': comp_name,
+                    'score_value': comp_value,
+                    'details': {'weight': WEIGHTS[comp_name]},
+                    'computed_at': now,
+                })
+
+            # Flush batch every 50 companies (300 rows)
+            if len(batch) >= 300 or i == len(results) - 1:
                 try:
-                    client.table('company_scores').upsert({
-                        'company_id': r['company_id'],
-                        'score_type': comp_name,
-                        'score_value': comp_value,
-                        'details': {'weight': WEIGHTS[comp_name]},
-                        'computed_at': datetime.now().isoformat(),
-                    }, on_conflict='company_id,score_type').execute()
-                except Exception:
-                    pass  # component scores are secondary
+                    client.table('company_scores').insert(batch).execute()
+                    success += len(batch)
+                except Exception as e:
+                    errors += len(batch)
+                    if errors <= 5:
+                        print(f"    Batch error: {e}")
+                batch = []
 
-            if (i + 1) % 200 == 0:
-                print(f"    ... {i + 1}/{len(results)}")
+                if (i + 1) % 200 == 0:
+                    print(f"    ... {i + 1}/{len(results)} companies")
 
-        print(f"  Written: {success}/{len(results)} (errors: {errors})")
+        print(f"  Written: {success} rows ({errors} errors)")
     else:
         print(f"\n  Run with --apply to write scores to Supabase")
 

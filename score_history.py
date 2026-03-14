@@ -156,21 +156,39 @@ def calculate_trends(client, apply: bool) -> dict:
 
     # Write trend scores
     if apply:
+        # Delete old trend scores first
+        try:
+            client.table('company_scores').delete().in_('score_type', ['trend_7d', 'trend_30d']).execute()
+        except Exception:
+            pass
+
         written = 0
+        now = datetime.now().isoformat()
+        batch = []
         for period, period_trends in trends.items():
             score_type = f'trend_{period}'
             for cid, trend in period_trends.items():
-                try:
-                    client.table('company_scores').upsert({
-                        'company_id': cid,
-                        'score_type': score_type,
-                        'score_value': trend['delta'],
-                        'details': {'direction': trend['direction'], 'period_days': 7 if period == '7d' else 30},
-                        'computed_at': datetime.now().isoformat(),
-                    }, on_conflict='company_id,score_type').execute()
-                    written += 1
-                except Exception:
-                    pass
+                batch.append({
+                    'company_id': cid,
+                    'score_type': score_type,
+                    'score_value': trend['delta'],
+                    'details': {'direction': trend['direction'], 'period_days': 7 if period == '7d' else 30},
+                    'computed_at': now,
+                })
+                if len(batch) >= 300:
+                    try:
+                        client.table('company_scores').insert(batch).execute()
+                        written += len(batch)
+                    except Exception:
+                        pass
+                    batch = []
+
+        if batch:
+            try:
+                client.table('company_scores').insert(batch).execute()
+                written += len(batch)
+            except Exception:
+                pass
 
         print(f"\n  Written: {written} trend scores")
     else:
