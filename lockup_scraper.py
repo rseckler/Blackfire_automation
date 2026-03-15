@@ -21,6 +21,7 @@ import argparse
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from typing import Optional
@@ -48,13 +49,19 @@ import supabase_helper
 MARKETBEAT_URL = 'https://www.marketbeat.com/ipos/lockup-expirations/'
 
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                   'AppleWebKit/537.36 (KHTML, like Gecko) '
-                  'Chrome/124.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                  'Chrome/131.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
+    'Accept-Encoding': 'gzip, deflate, br, zstd',
     'Connection': 'keep-alive',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'Upgrade-Insecure-Requests': '1',
+    'Cache-Control': 'max-age=0',
 }
 
 # Default lock-up period (days) for auto-calculation from IPO date
@@ -117,10 +124,24 @@ def scrape_marketbeat() -> list[dict]:
     print("  Fetching MarketBeat lock-up expirations page...")
 
     try:
-        resp = requests.get(MARKETBEAT_URL, headers=HEADERS, timeout=30)
+        # Use a session to maintain cookies across requests
+        session = requests.Session()
+        session.headers.update(HEADERS)
+
+        # First visit homepage to get cookies/session
+        try:
+            session.get('https://www.marketbeat.com/', timeout=15)
+            time.sleep(1)
+        except Exception:
+            pass  # Non-critical, continue anyway
+
+        # Now fetch the actual page with Referer
+        session.headers['Referer'] = 'https://www.marketbeat.com/ipos/'
+        resp = session.get(MARKETBEAT_URL, timeout=30)
         resp.raise_for_status()
     except requests.RequestException as e:
         print(f"  [MarketBeat] Error fetching page: {e}")
+        print(f"  (MarketBeat may block automated requests — lock-up data from auto-calculation only)")
         return []
 
     soup = BeautifulSoup(resp.text, 'html.parser')
