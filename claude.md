@@ -1,14 +1,14 @@
 # Blackfire Automation - Systemdokumentation
 
 **Status:** Production Ready - Deployed auf Hostinger VPS
-**Datum:** 13. März 2026
-**Version:** 3.3 (Phase 2 News-Automatisierung deployed)
+**Datum:** 15. März 2026
+**Version:** 3.4 (SPAC & Lock-up Tracking)
 
 ---
 
 ## Übersicht
 
-6 automatisierte Workflows laufen 24/7 auf Hostinger VPS:
+8 automatisierte Workflows laufen 24/7 auf Hostinger VPS:
 
 ### 1. Passive Income Generator (06:00 MEZ)
 - **Repo:** https://github.com/rseckler/Passive-Income-Generator
@@ -39,7 +39,7 @@
 ### 5. IPO Tracker (täglich 07:00 UTC)
 - **Repo:** https://github.com/rseckler/Blackfire_automation
 - **Path:** `/root/Blackfire_automation`
-- **Funktion:** Finnhub (90 IPOs) + Nasdaq + Brave Search → company_events (event_type: 'ipo')
+- **Funktion:** Finnhub (90 IPOs) + Nasdaq + Brave Search → company_events (event_type: 'ipo') + auto Lock-up Events (IPO+180d)
 - **Matching:** Fuzzy-Matching gegen 518 Private/Pre-IPO Companies (70% Threshold)
 - **Status:** Aktiv
 
@@ -49,6 +49,21 @@
 - **Funktion:** yfinance Earnings-Termine → company_events (event_type: 'earnings')
 - **Scope:** ~1193 Public Companies mit gültigem Symbol → 399 Termine
 - **Status:** Aktiv
+
+### 7. SPAC Tracker (täglich 07:30 UTC)
+- **Repo:** https://github.com/rseckler/Blackfire_automation
+- **Path:** `/root/Blackfire_automation`
+- **Funktion:** SEC EDGAR EFTS API (SIC 6770) + Brave Search → company_events (event_type: spac_announced/vote/closing/deadline)
+- **Daten:** SPAC Sponsor, Trust Size, Pre-Merger Ticker, Exchange in event_metadata JSONB
+- **Matching:** Fuzzy-Matching gegen alle Companies (70% Threshold), Updates listing_status → 'spac'
+- **Status:** Neu (2026-03-15) — VPS Deployment ausstehend
+
+### 8. Lock-up Scraper (wöchentlich Montag 07:00 UTC)
+- **Repo:** https://github.com/rseckler/Blackfire_automation
+- **Path:** `/root/Blackfire_automation`
+- **Funktion:** MarketBeat Lock-up Calendar Scraping + Auto-Berechnung (IPO+180d) → company_events (event_type: lockup_expiry)
+- **Daten:** lockup_days, lockup_shares, lockup_percent_of_float, confidence (confirmed/estimated) in event_metadata JSONB
+- **Status:** Neu (2026-03-15) — VPS Deployment ausstehend
 
 ---
 
@@ -138,12 +153,16 @@ Alle Scripts nutzen dieses Modul für Supabase-Zugriff:
 │   ├── news_collector.py          # RSS + Brave Search News-Sammlung (alle 2h)
 │   ├── ipo_tracker.py             # IPO-Kalender Finnhub+Nasdaq+Brave (täglich)
 │   ├── earnings_calendar.py       # Earnings-Termine via yfinance (wöchentlich)
+│   ├── spac_tracker.py            # SPAC Tracking SEC EDGAR + Brave (täglich)
+│   ├── lockup_scraper.py          # Lock-up Scraping MarketBeat + auto-calc (wöchentlich)
 │   ├── invalid_companies.json     # Blacklist (Supabase UUIDs, TTL 30d)
 │   ├── sync_cron.log
 │   ├── stock_prices.log
 │   ├── news.log                   # News Collector Output
 │   ├── ipo.log                    # IPO Tracker Output
-│   └── earnings.log               # Earnings Calendar Output
+│   ├── earnings.log               # Earnings Calendar Output
+│   ├── spac.log                   # SPAC Tracker Output
+│   └── lockup.log                 # Lock-up Scraper Output
 │
 └── Passive-Income-Generator/
     ├── venv/
@@ -169,8 +188,14 @@ Alle Scripts nutzen dieses Modul für Supabase-Zugriff:
 # News Collector (alle 2 Stunden)
 0 */2 * * * /root/Blackfire_automation/venv/bin/python3 /root/Blackfire_automation/news_collector.py --apply >> /root/Blackfire_automation/news.log 2>&1
 
-# IPO Tracker (täglich 07:00 UTC)
+# IPO Tracker (täglich 07:00 UTC) — now also creates auto Lock-up events (IPO+180d)
 0 7 * * * /root/Blackfire_automation/venv/bin/python3 /root/Blackfire_automation/ipo_tracker.py --apply >> /root/Blackfire_automation/ipo.log 2>&1
+
+# SPAC Tracker (täglich 07:30 UTC) — SEC EDGAR + Brave Search
+30 7 * * * /root/Blackfire_automation/venv/bin/python3 /root/Blackfire_automation/spac_tracker.py --apply >> /root/Blackfire_automation/spac.log 2>&1
+
+# Lock-up Scraper (wöchentlich Montag 07:00 UTC) — MarketBeat + auto-calc
+0 7 * * 1 /root/Blackfire_automation/venv/bin/python3 /root/Blackfire_automation/lockup_scraper.py --apply >> /root/Blackfire_automation/lockup.log 2>&1
 
 # Earnings Calendar (wöchentlich Sonntag 06:00 UTC)
 0 6 * * 0 /root/Blackfire_automation/venv/bin/python3 /root/Blackfire_automation/earnings_calendar.py --apply >> /root/Blackfire_automation/earnings.log 2>&1
@@ -361,6 +386,20 @@ git pull
 
 ## Deployment Changelog
 
+### 15. März 2026 - SPAC & Lock-up Tracking (v3.4)
+- **2 neue Scripts:**
+  - `spac_tracker.py`: SEC EDGAR EFTS API (SIC 6770, 4 Suchbegriffe) + Brave Search (5 Queries). Erkennt SPAC-Filings (S-1, DEFM14A, 8-K), klassifiziert in 4 Event-Types (spac_announced/vote/closing/deadline). Fuzzy-Matching gegen alle Companies. Speichert Sponsor, Trust Size, Ticker, Exchange in event_metadata JSONB. Updates listing_status → 'spac'.
+  - `lockup_scraper.py`: Scrapt MarketBeat Lock-up Expirations Calendar (BeautifulSoup). Auto-berechnet Lock-up für IPO-Events ohne lockup_expiry (IPO+180d). Speichert lockup_days, lockup_shares, lockup_percent_of_float, confidence in event_metadata JSONB.
+- **3 erweiterte Scripts:**
+  - `ipo_tracker.py`: Neuer Step 7 — auto-erstellt lockup_expiry Events für jeden IPO-Match (IPO+180d, confidence: estimated). Dedup gegen bestehende Lock-up Events.
+  - `news_collector.py`: Neue catalyst_types 'spac' und 'lockup'. Neue Phase 5 — auto-erstellt SPAC/Lock-up Events aus News mit Relevanz >= 3 (confidence: rumored). Dedup gegen bestehende Events.
+  - `alert_generator.py`: 2 neue Alert-Types: lockup_approaching (Lock-up <14d, HIGH priority) und spac_milestone (SPAC Event <14d, HIGH priority).
+- **2 neue Cronjobs geplant:**
+  - SPAC Tracker: täglich 07:30 UTC
+  - Lock-up Scraper: wöchentlich Montag 07:00 UTC
+- **Neue Dependencies:** `beautifulsoup4>=4.12.0` (für lockup_scraper.py)
+- **DB Migration:** `event_metadata JSONB` Spalte auf `company_events` (via Supabase SQL Editor)
+
 ### 13. März 2026 - Phase 2 News-Automatisierung (v3.3)
 - **3 neue Scripts deployed:**
   - `news_collector.py`: RSS-Feeds (TechCrunch, Reuters, Yahoo Finance, MarketWatch, Seeking Alpha) + Brave Search API für company-spezifische News. Company-Matching by Symbol + Name. Duplikat-Erkennung via URL. 39+ Artikel/Run.
@@ -491,4 +530,13 @@ git pull
 - [x] Phase 2 Cronjobs eingerichtet
 - [x] Linear Issues RSE-170, RSE-174–177 → Done
 
-**Status:** All Systems Operational - VPS Production Deployed (v3.3)
+- [x] spac_tracker.py created (SEC EDGAR + Brave Search)
+- [x] lockup_scraper.py created (MarketBeat + auto-calc)
+- [x] ipo_tracker.py erweitert (auto Lock-up bei IPO Events)
+- [x] news_collector.py erweitert (SPAC/Lock-up catalyst + auto-events)
+- [x] alert_generator.py erweitert (lockup_approaching + spac_milestone)
+- [ ] VPS Deploy: git pull + pip install beautifulsoup4
+- [ ] VPS: 2 neue Cronjobs einrichten (spac_tracker, lockup_scraper)
+- [ ] Supabase: event_metadata JSONB Migration ausführen
+
+**Status:** All Systems Operational - VPS Production Deployed (v3.4 — VPS deploy pending for new scripts)
