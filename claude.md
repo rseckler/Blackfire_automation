@@ -56,14 +56,14 @@
 - **Funktion:** SEC EDGAR EFTS API (SIC 6770) + Brave Search → company_events (event_type: spac_announced/vote/closing/deadline)
 - **Daten:** SPAC Sponsor, Trust Size, Pre-Merger Ticker, Exchange in event_metadata JSONB
 - **Matching:** Fuzzy-Matching gegen alle Companies (70% Threshold), Updates listing_status → 'spac'
-- **Status:** Neu (2026-03-15) — VPS Deployment ausstehend
+- **Status:** Aktiv (2026-03-15)
 
 ### 8. Lock-up Scraper (wöchentlich Montag 07:00 UTC)
 - **Repo:** https://github.com/rseckler/Blackfire_automation
 - **Path:** `/root/Blackfire_automation`
 - **Funktion:** MarketBeat Lock-up Calendar Scraping + Auto-Berechnung (IPO+180d) → company_events (event_type: lockup_expiry)
 - **Daten:** lockup_days, lockup_shares, lockup_percent_of_float, confidence (confirmed/estimated) in event_metadata JSONB
-- **Status:** Neu (2026-03-15) — VPS Deployment ausstehend
+- **Status:** Aktiv (2026-03-15)
 
 ---
 
@@ -535,8 +535,9 @@ git pull
 - [x] ipo_tracker.py erweitert (auto Lock-up bei IPO Events)
 - [x] news_collector.py erweitert (SPAC/Lock-up catalyst + auto-events)
 - [x] alert_generator.py erweitert (lockup_approaching + spac_milestone)
-- [ ] VPS Deploy: git pull + pip install beautifulsoup4
-- [ ] VPS: 2 neue Cronjobs einrichten (spac_tracker, lockup_scraper)
-- [ ] Supabase: event_metadata JSONB Migration ausführen
+- [x] VPS Deploy: git pull + pip install beautifulsoup4
+- [x] VPS: 2 neue Cronjobs eingerichtet (spac_tracker daily 07:30, lockup_scraper Mon 07:00)
+- [x] Supabase: event_metadata JSONB Migration ausgeführt
+- [x] Initial Run: lockup_scraper --apply (20 lockup_expiry events), spac_tracker --apply, ipo_tracker --apply, news_collector --apply, alert_generator --apply
 
-**Status:** All Systems Operational - VPS Production Deployed (v3.4 — VPS deploy pending for new scripts)
+**Status:** All Systems Operational - VPS Production Deployed (v3.4)
