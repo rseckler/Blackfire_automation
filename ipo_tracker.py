@@ -405,6 +405,86 @@ def build_event_row(match: dict) -> dict:
     }
 
 
+def build_lockup_event_row(match: dict) -> Optional[dict]:
+    """Build a lockup_expiry event from an IPO match.
+
+    Auto-calculates lock-up date as IPO date + 180 days (default).
+    Returns None if IPO date is missing.
+    """
+    ipo = match['ipo']
+    company = match['company']
+    ipo_date_str = ipo.get('date', '')
+
+    if not ipo_date_str:
+        return None
+
+    try:
+        ipo_date = datetime.strptime(ipo_date_str, '%Y-%m-%d').date()
+    except (ValueError, TypeError):
+        return None
+
+    lockup_days = 180
+    lockup_date = ipo_date + timedelta(days=lockup_days)
+
+    # Only create lockup events for IPOs that haven't expired yet
+    # (lockup date must be in the future or within last 30 days)
+    if lockup_date < datetime.now().date() - timedelta(days=30):
+        return None
+
+    shares_str = ipo.get('shares', '')
+    shares_num = None
+    if shares_str:
+        try:
+            shares_num = int(str(shares_str).replace(',', '').replace('.', ''))
+        except (ValueError, TypeError):
+            pass
+
+    return {
+        'company_id': company['id'],
+        'event_type': 'lockup_expiry',
+        'event_date': lockup_date.isoformat(),
+        'description': f"Lock-up expiry: {lockup_days} Tage nach IPO ({ipo_date_str}). "
+                        f"{'~' + str(shares_num) + ' Shares werden frei. ' if shares_num else ''}"
+                        f"Exchange: {ipo.get('exchange', 'N/A')}",
+        'source': f"ipo_auto_calc:{ipo.get('source', 'unknown')}",
+        'event_metadata': json.dumps({
+            'lockup_days': lockup_days,
+            'lockup_shares': shares_num,
+            'ipo_date': ipo_date_str,
+            'source': 'ipo_auto_calc',
+            'confidence': 'estimated',
+            'last_verified': datetime.now().strftime('%Y-%m-%d'),
+        }),
+    }
+
+
+def get_existing_lockup_events(company_ids: list[str]) -> set[str]:
+    """Get existing lockup_expiry events to avoid duplicates.
+
+    Returns set of company_id strings that already have lockup events.
+    """
+    if not company_ids:
+        return set()
+
+    client = supabase_helper.get_client()
+    existing = set()
+
+    for i in range(0, len(company_ids), 50):
+        chunk = company_ids[i:i + 50]
+        try:
+            resp = client.table('company_events') \
+                .select('company_id') \
+                .eq('event_type', 'lockup_expiry') \
+                .in_('company_id', chunk) \
+                .execute()
+            for row in resp.data:
+                existing.add(row['company_id'])
+        except Exception as e:
+            print(f"  Warning: Could not check existing lockup events: {e}")
+
+    return existing
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -560,6 +640,51 @@ def main():
         print(f"  [DRY-RUN] Would insert {len(new_matches)} events. Use --apply to execute.\n")
 
     # -----------------------------------------------------------------------
+    # Step 7: Auto-create Lock-up Events for IPO matches
+    # -----------------------------------------------------------------------
+    lockup_inserted = 0
+    lockup_skipped = 0
+
+    if matches:
+        print(f"\nStep 7: Auto-creating Lock-up events for IPO matches...\n")
+
+        # Get company IDs that already have lockup events
+        all_matched_ids = [m['company']['id'] for m in matches]
+        existing_lockups = get_existing_lockup_events(all_matched_ids)
+
+        lockup_rows = []
+        for m in matches:
+            cid = m['company']['id']
+            if cid in existing_lockups:
+                lockup_skipped += 1
+                continue
+
+            lockup_row = build_lockup_event_row(m)
+            if lockup_row:
+                lockup_rows.append(lockup_row)
+
+        print(f"  Lock-up events to create: {len(lockup_rows)}")
+        print(f"  Skipped (already exists): {lockup_skipped}")
+        print(f"  Skipped (no IPO date):    {len(matches) - len(lockup_rows) - lockup_skipped}")
+
+        if lockup_rows and not dry_run:
+            client = supabase_helper.get_client()
+            for row in lockup_rows:
+                try:
+                    client.table('company_events').insert(row).execute()
+                    lockup_inserted += 1
+                    cname = next((m['company']['name'] for m in matches if m['company']['id'] == row['company_id']), '?')
+                    print(f"    Lock-up: {cname} — Expiry {row['event_date']}")
+                except Exception as e:
+                    print(f"    Failed lock-up insert: {e}")
+        elif lockup_rows and dry_run:
+            for row in lockup_rows[:5]:
+                cname = next((m['company']['name'] for m in matches if m['company']['id'] == row['company_id']), '?')
+                print(f"    [DRY-RUN] Lock-up: {cname} — Expiry {row['event_date']}")
+            if len(lockup_rows) > 5:
+                print(f"    ... and {len(lockup_rows) - 5} more")
+
+    # -----------------------------------------------------------------------
     # Summary
     # -----------------------------------------------------------------------
     elapsed = (datetime.now() - start_time).total_seconds()
@@ -575,9 +700,11 @@ def main():
     print(f"  Private/Pre-IPO:         {len(private_companies)}")
     print(f"  Strong matches:          {len(matches)}")
     print(f"  Duplicates skipped:      {duplicate_count}")
-    print(f"  New matches:             {len(new_matches)}")
+    print(f"  New IPO matches:         {len(new_matches)}")
     if not dry_run:
-        print(f"  Inserted to DB:          {inserted}")
+        print(f"  IPO events inserted:     {inserted}")
+    print(f"  Lock-up events created:  {lockup_inserted}")
+    print(f"  Lock-up skipped (dedup): {lockup_skipped}")
     print(f"  Weak matches (info):     {len(weak_matches)}")
     print(f"  Duration:                {elapsed:.1f}s")
     print(f"{'='*60}\n")

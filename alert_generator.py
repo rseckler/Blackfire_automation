@@ -34,6 +34,7 @@ ALERT_TYPES = [
     'price_jump', 'ipo_announced', 'earnings_surprise', 'score_change',
     'new_company', 'watchlist_price', 'newsletter_mention',
     'approaching_catalyst', 'stale_watchlist',
+    'lockup_approaching', 'spac_milestone',
 ]
 
 # Deduplication windows (hours)
@@ -47,6 +48,8 @@ DEDUP_WINDOWS = {
     'newsletter_mention': 168,  # 7 days
     'approaching_catalyst': 168,  # 7 days (1 per event per week)
     'stale_watchlist': 720,     # 30 days (1 per company per month)
+    'lockup_approaching': 168,   # 7 days
+    'spac_milestone': 168,       # 7 days
 }
 
 
@@ -601,6 +604,153 @@ def detect_stale_watchlist(client, watchlist_ids: set, existing: dict) -> list:
     return alerts
 
 
+def detect_lockup_approaching(client, existing_keyed: dict) -> list:
+    """Detect lock-up expiry events within next 14 days. High priority."""
+    alerts = []
+    today = datetime.now().date()
+    end_date = (today + timedelta(days=14)).isoformat()
+    today_str = today.isoformat()
+
+    try:
+        resp = client.table('company_events') \
+            .select('id, company_id, event_type, event_date, description, event_metadata') \
+            .eq('event_type', 'lockup_expiry') \
+            .gte('event_date', today_str) \
+            .lte('event_date', end_date) \
+            .execute()
+
+        company_ids = list(set(r['company_id'] for r in resp.data))
+        names = {}
+        for cid in company_ids:
+            try:
+                cr = client.table('companies').select('name').eq('id', cid).single().execute()
+                if cr.data:
+                    names[cid] = cr.data['name']
+            except Exception:
+                pass
+
+        for event in resp.data:
+            cid = event['company_id']
+            event_id = event.get('id', '')
+
+            if is_duplicate_keyed('lockup_approaching', cid, event_id, existing_keyed):
+                continue
+
+            name = names.get(cid, '?')
+            event_date = event.get('event_date', '')
+            meta = event.get('event_metadata') or {}
+
+            try:
+                days_until = (datetime.fromisoformat(event_date).date() - today).days
+            except (ValueError, TypeError):
+                days_until = 0
+
+            pct = meta.get('lockup_percent_of_float')
+            shares = meta.get('lockup_shares')
+            shares_str = f" ~{shares:,.0f} Shares" if shares else ""
+            pct_str = f" ({pct:.1f}% Float)" if pct else ""
+
+            alerts.append({
+                'company_id': cid,
+                'alert_type': 'lockup_approaching',
+                'priority': 'high',
+                'title': f"Lock-up Expiry in {days_until} Tagen",
+                'message': f"Lock-up fuer {name} laeuft am {event_date} aus.{shares_str}{pct_str}",
+                'condition': {
+                    'type': 'lockup_approaching',
+                    'event_id': event_id,
+                    'event_date': event_date,
+                    'days_until': days_until,
+                    'lockup_shares': shares,
+                    'lockup_percent_of_float': pct,
+                },
+                'is_active': True,
+                'is_read': False,
+            })
+    except Exception as e:
+        print(f"  Warning: Could not check lockup approaching: {e}")
+
+    return alerts
+
+
+def detect_spac_milestone(client, existing_keyed: dict) -> list:
+    """Detect SPAC milestone events within next 14 days. High priority."""
+    alerts = []
+    today = datetime.now().date()
+    end_date = (today + timedelta(days=14)).isoformat()
+    today_str = today.isoformat()
+
+    spac_types = ['spac_announced', 'spac_vote', 'spac_closing', 'spac_deadline']
+
+    try:
+        resp = client.table('company_events') \
+            .select('id, company_id, event_type, event_date, description, event_metadata') \
+            .in_('event_type', spac_types) \
+            .gte('event_date', today_str) \
+            .lte('event_date', end_date) \
+            .execute()
+
+        company_ids = list(set(r['company_id'] for r in resp.data))
+        names = {}
+        for cid in company_ids:
+            try:
+                cr = client.table('companies').select('name').eq('id', cid).single().execute()
+                if cr.data:
+                    names[cid] = cr.data['name']
+            except Exception:
+                pass
+
+        spac_labels = {
+            'spac_announced': 'SPAC Merger Announced',
+            'spac_vote': 'SPAC Shareholder Vote',
+            'spac_closing': 'SPAC Merger Closing',
+            'spac_deadline': 'SPAC Deadline',
+        }
+
+        for event in resp.data:
+            cid = event['company_id']
+            event_id = event.get('id', '')
+
+            if is_duplicate_keyed('spac_milestone', cid, event_id, existing_keyed):
+                continue
+
+            name = names.get(cid, '?')
+            event_date = event.get('event_date', '')
+            event_type = event.get('event_type', 'spac')
+            meta = event.get('event_metadata') or {}
+
+            try:
+                days_until = (datetime.fromisoformat(event_date).date() - today).days
+            except (ValueError, TypeError):
+                days_until = 0
+
+            label = spac_labels.get(event_type, event_type)
+            sponsor = meta.get('spac_sponsor', '')
+            sponsor_str = f" (Sponsor: {sponsor})" if sponsor else ""
+
+            alerts.append({
+                'company_id': cid,
+                'alert_type': 'spac_milestone',
+                'priority': 'high',
+                'title': f"{label} in {days_until} Tagen",
+                'message': f"{label} fuer {name} am {event_date}.{sponsor_str}",
+                'condition': {
+                    'type': 'spac_milestone',
+                    'event_id': event_id,
+                    'event_type': event_type,
+                    'event_date': event_date,
+                    'days_until': days_until,
+                    'spac_sponsor': sponsor,
+                },
+                'is_active': True,
+                'is_read': False,
+            })
+    except Exception as e:
+        print(f"  Warning: Could not check SPAC milestones: {e}")
+
+    return alerts
+
+
 def main():
     parser = argparse.ArgumentParser(description='Generate alerts for company events')
     parser.add_argument('--apply', action='store_true', help='Write alerts to Supabase')
@@ -685,6 +835,18 @@ def main():
         stale_alerts = detect_stale_watchlist(client, watchlist_ids, existing)
         print(f"  Found: {len(stale_alerts)} stale watchlist alerts")
         all_alerts.extend(stale_alerts)
+
+    if 'lockup_approaching' in types_to_run:
+        print("\n  Checking approaching lock-up expiries (next 14 days)...")
+        lockup_alerts = detect_lockup_approaching(client, existing_keyed)
+        print(f"  Found: {len(lockup_alerts)} lock-up approaching alerts")
+        all_alerts.extend(lockup_alerts)
+
+    if 'spac_milestone' in types_to_run:
+        print("\n  Checking SPAC milestones (next 14 days)...")
+        spac_alerts = detect_spac_milestone(client, existing_keyed)
+        print(f"  Found: {len(spac_alerts)} SPAC milestone alerts")
+        all_alerts.extend(spac_alerts)
 
     # Summary
     by_priority = Counter(a['priority'] for a in all_alerts)

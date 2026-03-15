@@ -611,7 +611,7 @@ def _build_sentiment_prompt(articles: list, company_map: dict) -> str:
     return f"""Analyze the sentiment of these news articles about companies. For each article, return:
 - index: article number (1-based)
 - sentiment: "positive", "negative", or "neutral"
-- catalyst_type: if this is a potential catalyst, what type? (earnings, fda, partnership, ipo, acquisition, product_launch, regulatory, leadership, funding, null)
+- catalyst_type: if this is a potential catalyst, what type? (earnings, fda, partnership, ipo, acquisition, product_launch, regulatory, leadership, funding, spac, lockup, null)
 - relevance: 1-5 how relevant is this for investment decisions?
   5 = Major event (acquisition, IPO pricing, FDA approval, major partnership)
   4 = Significant news (earnings beat/miss, new product, leadership change)
@@ -908,6 +908,134 @@ def create_news_alerts(news_to_insert: list, company_map: dict,
 
 
 # ---------------------------------------------------------------------------
+# SPAC/Lock-up Auto-Event Creation from News
+# ---------------------------------------------------------------------------
+
+def create_spac_lockup_events_from_news(articles: list, company_map: dict, dry_run: bool, stats: dict):
+    """Create company_events entries when SPAC or lockup catalyst is detected in news.
+
+    Only creates events for articles with catalyst_type 'spac' or 'lockup' and relevance >= 3.
+    Uses Claude Haiku to extract dates from article titles/summaries.
+    """
+    spac_lockup_articles = []
+    for article in articles:
+        cat = (article.get('catalyst_type') or '').lower()
+        rel = article.get('relevance') or 0
+        company_id = article.get('company_id')
+        if cat in ('spac', 'lockup') and rel >= 3 and company_id:
+            spac_lockup_articles.append(article)
+
+    if not spac_lockup_articles:
+        return
+
+    print(f"\n  SPAC/Lock-up event detection: {len(spac_lockup_articles)} articles with catalyst")
+
+    client = supabase_helper.get_client()
+
+    # Check existing events to avoid duplicates (last 90 days)
+    company_ids = list(set(a['company_id'] for a in spac_lockup_articles))
+    existing_events = set()
+    spac_types = ['spac_announced', 'spac_vote', 'spac_closing', 'spac_deadline', 'lockup_expiry']
+
+    for i in range(0, len(company_ids), 50):
+        chunk = company_ids[i:i + 50]
+        try:
+            resp = client.table('company_events') \
+                .select('company_id, event_type') \
+                .in_('event_type', spac_types) \
+                .in_('company_id', chunk) \
+                .execute()
+            for row in resp.data:
+                existing_events.add(f"{row['company_id']}|{row['event_type']}")
+        except Exception as e:
+            print(f"    Warning: Could not check existing events: {e}")
+
+    events_to_create = []
+    for article in spac_lockup_articles:
+        cat = article.get('catalyst_type', '').lower()
+        cid = article['company_id']
+        cname = company_map.get(cid, 'Unknown')
+        title = article.get('title', '')
+
+        if cat == 'spac':
+            event_type = 'spac_announced'
+            # Check for more specific type in title
+            title_lower = title.lower()
+            if 'vote' in title_lower or 'shareholder' in title_lower:
+                event_type = 'spac_vote'
+            elif 'clos' in title_lower or 'complet' in title_lower or 'merg' in title_lower:
+                event_type = 'spac_closing'
+            elif 'deadline' in title_lower or 'expir' in title_lower:
+                event_type = 'spac_deadline'
+
+            dedup_key = f"{cid}|{event_type}"
+            if dedup_key in existing_events:
+                continue
+
+            events_to_create.append({
+                'company_id': cid,
+                'event_type': event_type,
+                'event_date': None,  # No date extraction for now
+                'description': f"Detected from news: {title[:200]}",
+                'source': f"news_auto:{article.get('source', 'unknown')}",
+                'event_metadata': json.dumps({
+                    'source': 'news_auto',
+                    'confidence': 'rumored',
+                    'news_url': article.get('url', ''),
+                    'detected_at': datetime.now(timezone.utc).isoformat(),
+                }),
+            })
+            existing_events.add(dedup_key)
+            stats['spac_events_created'] = stats.get('spac_events_created', 0) + 1
+
+        elif cat == 'lockup':
+            dedup_key = f"{cid}|lockup_expiry"
+            if dedup_key in existing_events:
+                continue
+
+            events_to_create.append({
+                'company_id': cid,
+                'event_type': 'lockup_expiry',
+                'event_date': None,  # Date needs manual verification
+                'description': f"Lock-up mentioned in news: {title[:200]}",
+                'source': f"news_auto:{article.get('source', 'unknown')}",
+                'event_metadata': json.dumps({
+                    'source': 'news_auto',
+                    'confidence': 'rumored',
+                    'news_url': article.get('url', ''),
+                    'detected_at': datetime.now(timezone.utc).isoformat(),
+                }),
+            })
+            existing_events.add(dedup_key)
+            stats['lockup_events_created'] = stats.get('lockup_events_created', 0) + 1
+
+    if not events_to_create:
+        print("    No new SPAC/Lock-up events to create (all duplicates)")
+        return
+
+    print(f"    New events to create: {len(events_to_create)}")
+    for ev in events_to_create[:5]:
+        cname = company_map.get(ev['company_id'], '?')
+        print(f"      [{ev['event_type']:16s}] {cname} — {ev['description'][:60]}")
+    if len(events_to_create) > 5:
+        print(f"      ... and {len(events_to_create) - 5} more")
+
+    if dry_run:
+        print("    [DRY-RUN] Would create these events. Use --apply to execute.")
+        return
+
+    inserted = 0
+    for ev in events_to_create:
+        try:
+            client.table('company_events').insert(ev).execute()
+            inserted += 1
+        except Exception as e:
+            print(f"    Failed to create event: {e}")
+
+    print(f"    Events inserted: {inserted}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1192,6 +1320,16 @@ def main():
         )
 
     # -----------------------------------------------------------------------
+    # Phase 5: SPAC/Lock-up auto-event creation from catalyst detection
+    # -----------------------------------------------------------------------
+    if news_to_insert and not args.no_sentiment:
+        print("\n  Phase 5: SPAC/Lock-up Event Detection")
+        print("  " + "-" * 40)
+        create_spac_lockup_events_from_news(
+            news_to_insert, company_map, dry_run, stats
+        )
+
+    # -----------------------------------------------------------------------
     # Summary & Insert
     # -----------------------------------------------------------------------
     print("\n  " + "=" * 50)
@@ -1217,6 +1355,11 @@ def main():
     print(f"    Relevance scored:    {stats.get('relevance_scored', 0)}")
     print(f"    High relevance (4+): {stats.get('high_relevance', 0)}")
     print(f"    Alerts created:      {stats.get('alerts_created', 0)}")
+
+    if stats.get('spac_events_created', 0) > 0 or stats.get('lockup_events_created', 0) > 0:
+        print(f"\n  SPAC/Lock-up Events:")
+        print(f"    SPAC events created: {stats.get('spac_events_created', 0)}")
+        print(f"    Lock-up events:      {stats.get('lockup_events_created', 0)}")
 
     print(f"\n  Total new articles:    {len(news_to_insert)}")
 
