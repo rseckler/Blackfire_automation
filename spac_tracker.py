@@ -339,15 +339,20 @@ def fetch_sec_edgar_spacs(days_back: int = 90) -> list[dict]:
                 accession = source.get('file_num', '') or source.get('_id', '')
 
                 # Deduplicate across searches
-                filing_id = source.get('_id', accession)
+                filing_id = hit.get('_id', '') or accession
+                if isinstance(filing_id, list):
+                    filing_id = filing_id[0] if filing_id else ''
+                filing_id = str(filing_id)
                 if filing_id in seen_accession_numbers:
                     continue
                 seen_accession_numbers.add(filing_id)
 
-                entity_name = source.get('entity_name', '') or source.get('display_names', [''])[0] if source.get('display_names') else ''
-                # Handle display_names as list
-                if isinstance(entity_name, list):
-                    entity_name = entity_name[0] if entity_name else ''
+                # Get entity name — may be in display_names (list) or entity_name (str)
+                display_names = source.get('display_names', [])
+                if isinstance(display_names, list) and display_names:
+                    entity_name = str(display_names[0])
+                else:
+                    entity_name = str(source.get('entity_name', '') or '')
 
                 filing_date = source.get('file_date', '') or source.get('period_of_report', '')
                 form_type = source.get('form_type', '')
