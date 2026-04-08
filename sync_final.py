@@ -9,6 +9,7 @@ import pandas as pd
 from io import BytesIO
 from dotenv import load_dotenv
 from datetime import datetime
+import re
 
 load_dotenv()
 
@@ -43,6 +44,23 @@ PROTECTED_PROPERTIES = {
     'listing_status',
     'prio_buy',
 }
+
+# --- Fuzzy Name Matching ---
+_LEGAL_SUFFIXES = re.compile(
+    r',?\s*\b(inc\.?|incorporated|corp\.?|corporation|ltd\.?|limited|'
+    r'llc\.?|plc\.?|co\.?|company|group|holdings?|s\.?a\.?|ag|se|n\.?v\.?|'
+    r'gmbh|& co\.?\s*(kg|kgaa)?)\s*\.?\s*$',
+    re.IGNORECASE
+)
+
+def normalize_company_name(name: str) -> str:
+    """Normalize for fuzzy matching: lowercase, strip legal suffixes, collapse whitespace."""
+    n = name.lower().strip()
+    n = _LEGAL_SUFFIXES.sub('', n)
+    n = _LEGAL_SUFFIXES.sub('', n)  # zweimal fuer gestapelte Suffixe
+    n = re.sub(r'\s+', ' ', n).strip()
+    n = n.rstrip('., ')
+    return n
 
 
 class SyncWithLogging:
@@ -107,6 +125,8 @@ class SyncWithLogging:
             # Build lookup maps
             by_satellog = {}
             by_name = {}
+            by_name_lower = {}
+            by_name_normalized = {}
             for company in companies:
                 satellog = (company.get('satellog') or '').strip()
                 name = (company.get('name') or '').strip()
@@ -114,20 +134,37 @@ class SyncWithLogging:
                     by_satellog[satellog] = company
                 if name:
                     by_name[name] = company
+                    name_lower = name.lower()
+                    if name_lower not in by_name_lower:
+                        by_name_lower[name_lower] = company
+                    name_norm = normalize_company_name(name)
+                    if name_norm and name_norm not in by_name_normalized:
+                        by_name_normalized[name_norm] = company
 
-            return {'by_satellog': by_satellog, 'by_name': by_name}
+            return {
+                'by_satellog': by_satellog,
+                'by_name': by_name,
+                'by_name_lower': by_name_lower,
+                'by_name_normalized': by_name_normalized,
+            }
 
         except Exception as e:
             print(f"   Error: {e}")
             self.stats['error_message'] = str(e)
             return None
 
-    def build_company_data(self, excel_row, identifier, satellog_value):
+    def build_company_data(self, excel_row, identifier, satellog_value, is_update=False):
         """Build company data dict for Supabase"""
         company_data = {
             'name': identifier,
-            'satellog': str(satellog_value).strip() if satellog_value and str(satellog_value) != 'nan' else identifier
         }
+        sat = str(satellog_value).strip() if satellog_value and str(satellog_value) != 'nan' else ''
+        if sat:
+            company_data['satellog'] = sat
+        elif not is_update:
+            # For new companies without york, use name as satellog
+            company_data['satellog'] = identifier
+        # For updates without york: don't overwrite existing satellog
 
         extra_data = {}
 
@@ -195,19 +232,19 @@ class SyncWithLogging:
                 satellog_col = col
                 break
 
-        # Determine name column
-        if satellog_col and satellog_col == identifier_col:
-            name_col = None
-            for col in df.columns:
-                if col in ('Name', 'Company_Name', 'name'):
-                    name_col = col
-                    break
-        else:
-            name_col = None
+        # Determine name column (always search for it)
+        name_col = None
+        for col in df.columns:
+            if col in ('Name', 'Company_Name', 'name'):
+                name_col = col
+                break
 
         to_update = []
         to_create = []
         skipped = 0
+        fuzzy_case = 0
+        fuzzy_norm = 0
+        seen_create_keys = set()
 
         for idx, row in df.iterrows():
             # Get satellog value
@@ -225,13 +262,31 @@ class SyncWithLogging:
                 identifier = satellog_value
 
             if not satellog_value or satellog_value == 'nan':
-                skipped += 1
-                continue
+                # Fallback: try Company_Name if york is empty
+                if identifier and identifier != 'nan' and identifier != satellog_value:
+                    satellog_value = ''
+                else:
+                    skipped += 1
+                    continue
 
-            # Match by satellog first, then by name
-            existing_company = existing['by_satellog'].get(satellog_value) or existing['by_name'].get(identifier)
+            # Tier 1: exakter Satellog-Match
+            existing_company = existing['by_satellog'].get(satellog_value)
+            # Tier 2: exakter Name-Match
+            if not existing_company:
+                existing_company = existing['by_name'].get(identifier)
+            # Tier 3: case-insensitiver Name-Match
+            if not existing_company:
+                existing_company = existing['by_name_lower'].get(identifier.lower())
+                if existing_company:
+                    fuzzy_case += 1
+            # Tier 4: normalisierter Name-Match (ohne Legal-Suffixe)
+            if not existing_company:
+                existing_company = existing['by_name_normalized'].get(normalize_company_name(identifier))
+                if existing_company:
+                    fuzzy_norm += 1
 
-            company_data = self.build_company_data(row.to_dict(), identifier, satellog_value)
+            is_update = existing_company is not None
+            company_data = self.build_company_data(row.to_dict(), identifier, satellog_value, is_update=is_update)
 
             if existing_company:
                 to_update.append({
@@ -240,6 +295,13 @@ class SyncWithLogging:
                     'existing_extra_data': existing_company.get('extra_data', {})
                 })
             else:
+                # Deduplicate creates by satellog value
+                create_key = company_data.get('satellog', '').lower()
+                if create_key and create_key in seen_create_keys:
+                    skipped += 1
+                    continue
+                if create_key:
+                    seen_create_keys.add(create_key)
                 to_create.append(company_data)
 
         self.stats['updates'] = len(to_update)
@@ -249,6 +311,10 @@ class SyncWithLogging:
         print(f"   Creates: {len(to_create)}")
         if skipped:
             print(f"   Skipped: {skipped}")
+        if fuzzy_case:
+            print(f"   Fuzzy (case-insensitive): {fuzzy_case}")
+        if fuzzy_norm:
+            print(f"   Fuzzy (normalized): {fuzzy_norm}")
 
         return {'updates': to_update, 'creates': to_create}
 
@@ -284,18 +350,30 @@ class SyncWithLogging:
         return success
 
     def create_companies(self, creates):
-        """Create new companies in Supabase"""
+        """Create new companies in Supabase (individual inserts for resilience)"""
         print(f"\n  Creating {len(creates)} companies...")
 
         if not creates:
             return 0
 
-        if supabase_helper.insert_companies(creates):
-            print(f"   Created {len(creates)} companies")
-            return len(creates)
-        else:
-            print(f"   Failed to create companies")
-            return 0
+        success = 0
+        failed = 0
+        client = supabase_helper.get_client()
+        for company in creates:
+            try:
+                client.table('companies').insert(company).execute()
+                success += 1
+            except Exception as e:
+                if '23505' in str(e):  # duplicate key
+                    pass  # silently skip duplicates
+                else:
+                    failed += 1
+                    print(f"   Insert failed for {company.get('name', '?')}: {e}")
+
+        print(f"   Created: {success}")
+        if failed:
+            print(f"   Failed: {failed}")
+        return success
 
     def log_sync(self):
         """Log sync result to sync_history table"""
