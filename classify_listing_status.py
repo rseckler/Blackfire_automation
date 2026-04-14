@@ -32,7 +32,7 @@ import supabase_helper
 
 # Keywords in extra_data.Status that indicate listing status.
 # Check order: more-specific first (PRIVATE before PUBLIC so "not listed" → private, not public via "listed").
-ACQUIRED_KEYWORDS = ['acquired', 'übernommen', 'merged', 'delisted', 'bankrupt', 'insolvent']
+ACQUIRED_KEYWORDS = ['acquired', 'aquired', 'übernommen', 'merged', 'delisted', 'bankrupt', 'insolvent', 'rebranded']
 PRE_IPO_KEYWORDS = ['pre-ipo', 'pre ipo', 'ipo planned', 'ipo expected', 'ipo geplant', 'spac']
 PRIVATE_KEYWORDS = ['private', 'privat', 'not listed', 'nicht gelistet', 'unlisted']
 PUBLIC_KEYWORDS = ['public', 'öffentlich', 'listed', 'gelistet', 'börsennotiert', 'börse', 'ipo done', 'ipo completed']
