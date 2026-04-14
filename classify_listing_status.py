@@ -4,9 +4,9 @@ Classify companies as public/private/pre_ipo/acquired/unknown.
 
 Priority order (Tommi 2026-04-14: Excel is source of truth):
   1. extra_data.Status keywords   → acquired/pre_ipo/private/public (explicit Excel value wins)
-  2. IPO_expected present         → pre_ipo
-  3. current_price > 0            → public
-  4. extra_data.Current_Price > 0 → public
+  2. current_price > 0            → public (post-IPO price beats stale IPO_expected flag)
+  3. extra_data.Current_Price > 0 → public
+  4. IPO_expected (non-whitespace) → pre_ipo
   5. Has validated symbol         → public (weakest heuristic)
   6. invalid_companies.json       → private (all ticker methods failed)
   7. else                         → unknown
@@ -79,24 +79,27 @@ def classify(company: dict, blacklisted_ids: set) -> tuple:
             if kw in status_raw:
                 return 'public', f'excel:public({status_raw!r})'
 
-    # 2. IPO_expected set → pre_ipo (before price signal — a scheduled IPO overrides stale price data)
-    ipo_expected = extra.get('IPO_expected') or extra.get('IPO Expected') or extra.get('IPO_Expected')
-    if ipo_expected:
-        return 'pre_ipo', 'ipo_expected_set'
-
-    # 3. Has a valid current price → public
+    # 2. Has a valid current price → public (a price post-IPO overrides a stale IPO_expected flag).
+    # This catches companies like MetaX that went public after IPO_expected was originally set.
     price = company.get('current_price')
     if price and float(price) > 0:
         return 'public', 'has_current_price'
 
-    # 4. Has a price in extra_data
-    ed_price = extra.get('Current_Price')
-    if ed_price:
+    # 3. Has a price in extra_data
+    ed_price_raw = extra.get('Current_Price')
+    if ed_price_raw and str(ed_price_raw).strip():
         try:
-            if float(str(ed_price).replace(',', '.')) > 0:
+            if float(str(ed_price_raw).replace(',', '.').strip()) > 0:
                 return 'public', 'has_extra_price'
         except (ValueError, TypeError):
             pass
+
+    # 4. IPO_expected set → pre_ipo (only after price checks; empty/whitespace values ignored)
+    ipo_expected = (
+        extra.get('IPO_expected') or extra.get('IPO Expected') or extra.get('IPO_Expected')
+    )
+    if ipo_expected and str(ipo_expected).strip():
+        return 'pre_ipo', 'ipo_expected_set'
 
     # 5. Has a validated symbol → public (weakest heuristic; a private company with pending ticker
     # pollutes here — this is why Excel Status must take priority above)
