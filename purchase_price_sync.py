@@ -109,34 +109,40 @@ def parse_purchase_value(raw) -> float | None:
     return v
 
 
-def extract_purchase_price(company: dict, expected_currency: str) -> tuple:
+def extract_purchase_price(company: dict) -> tuple:
     """
-    Returns (price, currency, source_column) oder (None, None, None).
+    Returns (price, currency, source_column, other_filled_columns).
 
-    Per Tommi Frage 3a (strikt): NUR die Spalte nehmen, die zur
-    Handelsplatz-Währung passt. KEIN Fallback auf andere Spalten —
-    wenn primary leer, gar nichts importieren. Das verhindert, dass
-    Tippfehler in Excel (falsche Spalte befüllt) als korrekte Purchase
-    interpretiert werden.
+    Per Tommi Frage 1 Option A: Jede Purchase-Spalte = ein Kauf in der
+    Spalten-Währung. Pro Firma **normalerweise nur eine Spalte** gefüllt.
+    Wir trusten Tommis Excel-Eintrag: die Spalte, in der er den Wert
+    eingetragen hat, bestimmt die Währung — unabhängig von extra_data.Currency
+    (das kommt von yfinance und kann vom Handelsplatz abweichen; Tommi
+    denkt aber in der Währung in der er tatsächlich gekauft hat).
 
-    Ignoriert immer Purchase_2_$ und Purchased_Amount (veraltet).
+    Wenn MEHRERE Spalten gefüllt sind → erste non-empty (Insertion-Order
+    der CURRENCY_COLUMN_MAP, praktisch: USD zuerst, dann EUR, dann andere)
+    UND log die anderen als Warning.
+
+    Ignoriert immer Purchase_2_$ und Purchased_Amount (per Tommi veraltet).
     """
     extra = company.get('extra_data') or {}
 
-    # Finde die Spalte zur erwarteten Währung
-    primary_column = None
+    filled = []
     for col, curr in CURRENCY_COLUMN_MAP.items():
-        if curr == expected_currency:
-            primary_column = col
-            break
-
-    if primary_column and primary_column in extra:
-        price = parse_purchase_value(extra[primary_column])
+        if col not in extra:
+            continue
+        price = parse_purchase_value(extra[col])
         if price is not None:
-            return price, expected_currency, primary_column
+            filled.append((col, curr, price))
 
-    # Kein passender Primär-Wert — nichts importieren
-    return None, None, None
+    if not filled:
+        return None, None, None, []
+
+    # Erste Spalte (Insertion-Order) = primary; Rest als Warning zurückgeben
+    primary_col, primary_curr, primary_price = filled[0]
+    others = [(c, cu, p) for (c, cu, p) in filled[1:]]
+    return primary_price, primary_curr, primary_col, others
 
 
 def load_companies(client) -> list:
@@ -186,7 +192,7 @@ def main():
     updates = []       # new or changed purchase_price
     unchanged = 0      # Excel value same as DB
     source_cols = Counter()
-    missing_primary = []  # companies with filled wrong-currency columns (data-quality report)
+    multi_filled = []  # companies with multiple Purchase-* columns filled (unusual)
 
     for c in companies:
         extra = c.get('extra_data') or {}
@@ -197,28 +203,19 @@ def main():
             stats['no_purchase_columns'] += 1
             continue
 
-        expected_currency = determine_expected_currency(c)
-        price, currency, source = extract_purchase_price(c, expected_currency)
+        price, currency, source, others = extract_purchase_price(c)
 
         if price is None:
-            stats['primary_column_empty'] += 1
-            # Data-quality check: sind OTHER Purchase-Spalten gefüllt?
-            # Das könnte ein Tippfehler in Tommis Excel sein (Wert in falscher Spalte)
-            for other_col, other_curr in CURRENCY_COLUMN_MAP.items():
-                if other_curr == expected_currency:
-                    continue
-                if other_col not in extra:
-                    continue
-                val = parse_purchase_value(extra[other_col])
-                if val is not None:
-                    missing_primary.append({
-                        'name': c.get('name'),
-                        'expected': expected_currency,
-                        'found_in': other_col,
-                        'value': val,
-                    })
-                    break
+            stats['no_purchase_value'] += 1
             continue
+
+        if others:
+            multi_filled.append({
+                'name': c.get('name'),
+                'primary': f'{source}={price} {currency}',
+                'others': [f'{col}={p} {cu}' for col, cu, p in others],
+            })
+            stats['multiple_columns_filled'] += 1
 
         source_cols[source] += 1
 
@@ -258,14 +255,13 @@ def main():
         for col, count in sorted(source_cols.items(), key=lambda x: -x[1]):
             print(f"    {col:22s}: {count:5d}")
 
-    if missing_primary:
-        print(f"\n  ⚠  Datenqualität-Hinweis an Tommi: primary Purchase-Spalte leer,")
-        print(f"     aber OTHER Spalte hat Wert (vermutlich in falscher Spalte eingetragen):")
-        for f in missing_primary[:15]:
-            print(f"    {f['name'][:35]:35s}  expected={f['expected']:3s}  gefunden: {f['found_in']} = {f['value']}")
-        if len(missing_primary) > 15:
-            print(f"    ... + {len(missing_primary) - 15} weitere")
-        print(f"     → diese Zeilen werden NICHT importiert. Tommi: bitte Excel prüfen.")
+    if multi_filled:
+        print(f"\n  ⚠  Datenqualität-Hinweis an Tommi: mehrere Purchase-Spalten gefüllt.")
+        print(f"     Blackfire nimmt die erste (Insertion-Order USD/EUR/GBP/…). Bitte prüfen:")
+        for f in multi_filled[:10]:
+            print(f"    {f['name'][:35]:35s}  primary: {f['primary']}  andere: {', '.join(f['others'])}")
+        if len(multi_filled) > 10:
+            print(f"    ... + {len(multi_filled) - 10} weitere")
 
     print(f"\n  Updates to apply: {len(updates)}")
     if updates and args.verbose:
