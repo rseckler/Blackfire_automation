@@ -113,16 +113,17 @@ def extract_purchase_price(company: dict, expected_currency: str) -> tuple:
     """
     Returns (price, currency, source_column) oder (None, None, None).
 
-    Strategie:
-      1. Primär: Spalte die zur expected_currency passt
-      2. Fallback: Falls Primär leer, erste non-empty Spalte nehmen (und
-         mit deren Währung arbeiten — warn-case)
+    Per Tommi Frage 3a (strikt): NUR die Spalte nehmen, die zur
+    Handelsplatz-Währung passt. KEIN Fallback auf andere Spalten —
+    wenn primary leer, gar nichts importieren. Das verhindert, dass
+    Tippfehler in Excel (falsche Spalte befüllt) als korrekte Purchase
+    interpretiert werden.
 
-    Beide Strategien filtern Purchase_2_$ und Purchased_Amount aus (veraltet).
+    Ignoriert immer Purchase_2_$ und Purchased_Amount (veraltet).
     """
     extra = company.get('extra_data') or {}
 
-    # 1. Primär: Spalte zur erwarteten Währung
+    # Finde die Spalte zur erwarteten Währung
     primary_column = None
     for col, curr in CURRENCY_COLUMN_MAP.items():
         if curr == expected_currency:
@@ -134,16 +135,7 @@ def extract_purchase_price(company: dict, expected_currency: str) -> tuple:
         if price is not None:
             return price, expected_currency, primary_column
 
-    # 2. Fallback: irgendeine non-empty Currency-Spalte (Warn-Case)
-    for col, curr in CURRENCY_COLUMN_MAP.items():
-        if col == primary_column:
-            continue  # primary schon geprüft, war leer
-        if col not in extra:
-            continue
-        price = parse_purchase_value(extra[col])
-        if price is not None:
-            return price, curr, col
-
+    # Kein passender Primär-Wert — nichts importieren
     return None, None, None
 
 
@@ -194,7 +186,7 @@ def main():
     updates = []       # new or changed purchase_price
     unchanged = 0      # Excel value same as DB
     source_cols = Counter()
-    fallback_hits = []  # companies using fallback column (warn-case)
+    missing_primary = []  # companies with filled wrong-currency columns (data-quality report)
 
     for c in companies:
         extra = c.get('extra_data') or {}
@@ -209,18 +201,26 @@ def main():
         price, currency, source = extract_purchase_price(c, expected_currency)
 
         if price is None:
-            stats['all_purchase_cols_empty'] += 1
+            stats['primary_column_empty'] += 1
+            # Data-quality check: sind OTHER Purchase-Spalten gefüllt?
+            # Das könnte ein Tippfehler in Tommis Excel sein (Wert in falscher Spalte)
+            for other_col, other_curr in CURRENCY_COLUMN_MAP.items():
+                if other_curr == expected_currency:
+                    continue
+                if other_col not in extra:
+                    continue
+                val = parse_purchase_value(extra[other_col])
+                if val is not None:
+                    missing_primary.append({
+                        'name': c.get('name'),
+                        'expected': expected_currency,
+                        'found_in': other_col,
+                        'value': val,
+                    })
+                    break
             continue
 
         source_cols[source] += 1
-        if currency != expected_currency:
-            fallback_hits.append({
-                'name': c.get('name'),
-                'expected': expected_currency,
-                'got': currency,
-                'source': source,
-            })
-            stats['fallback_used'] += 1
 
         existing_row = existing.get(c['id'])
         if existing_row:
@@ -258,12 +258,14 @@ def main():
         for col, count in sorted(source_cols.items(), key=lambda x: -x[1]):
             print(f"    {col:22s}: {count:5d}")
 
-    if fallback_hits:
-        print(f"\n  ⚠  Fallback genutzt (Currency-Mismatch, erste non-empty Spalte):")
-        for f in fallback_hits[:10]:
-            print(f"    {f['name'][:30]:30s}  expected={f['expected']}  got={f['got']}  from={f['source']}")
-        if len(fallback_hits) > 10:
-            print(f"    ... + {len(fallback_hits) - 10} weitere")
+    if missing_primary:
+        print(f"\n  ⚠  Datenqualität-Hinweis an Tommi: primary Purchase-Spalte leer,")
+        print(f"     aber OTHER Spalte hat Wert (vermutlich in falscher Spalte eingetragen):")
+        for f in missing_primary[:15]:
+            print(f"    {f['name'][:35]:35s}  expected={f['expected']:3s}  gefunden: {f['found_in']} = {f['value']}")
+        if len(missing_primary) > 15:
+            print(f"    ... + {len(missing_primary) - 15} weitere")
+        print(f"     → diese Zeilen werden NICHT importiert. Tommi: bitte Excel prüfen.")
 
     print(f"\n  Updates to apply: {len(updates)}")
     if updates and args.verbose:
