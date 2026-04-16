@@ -58,10 +58,17 @@ def default_currency_for_country(country: str) -> str:
 
 
 def load_entry_prices(client) -> list:
-    """Load all rows from user_entry_prices."""
+    """Load user_entry_prices rows for WATCHLIST-phase companies only.
+
+    Per Tommi-Regel (v1.4 Frage 9): Buy-Zone only für Firmen die noch nicht
+    gekauft wurden — also purchase_price IS NULL. Portfolio-Firmen (mit
+    gesetztem purchase_price) sind für Stop-Loss/Stop-Win via sell_alert_checker.
+    """
     try:
         resp = client.table('user_entry_prices') \
             .select('user_id, company_id, entry_price, entry_currency, entry_set_at') \
+            .is_('purchase_price', 'null') \
+            .not_.is_('entry_price', 'null') \
             .execute()
         return resp.data or []
     except Exception as e:

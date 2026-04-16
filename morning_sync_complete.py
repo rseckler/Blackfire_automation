@@ -6,6 +6,9 @@ Complete Morning Sync
 2. ISIN/WKN Research (isin_wkn_updater.py)
 3. Classify listing status (classify_listing_status.py) — every sync
    (runs every 2h so Excel Status changes by Tommi propagate within 2h)
+4. Purchase-Price-Sync (purchase_price_sync.py) — every sync
+   (v1.4 Etappe 1: importiert Tommi's Purchase-Preise aus Excel BF–BM Spalten
+   in user_entry_prices; nutzt Handelsplatz-Währung)
 """
 
 import subprocess
@@ -77,6 +80,17 @@ result3 = subprocess.run(
 )
 if result3.returncode != 0:
     print("\n  Listing status classification had issues (non-critical)")
+
+# Step 4: Purchase-Price-Sync (v1.4 Etappe 1 — Tommi's Excel Purchase-Preise)
+print("\n" + "=" * 70)
+print("  Step 4: Purchase-Price-Sync (Tommi-Excel → user_entry_prices)...")
+print("-" * 70)
+result4 = subprocess.run(
+    [sys.executable, os.path.join(SCRIPT_DIR, 'purchase_price_sync.py'), '--apply'],
+    capture_output=False
+)
+if result4.returncode != 0:
+    print("\n  Purchase price sync had issues (non-critical)")
 
 print("\n" + "=" * 70)
 print("  MORNING SYNC COMPLETE!")
