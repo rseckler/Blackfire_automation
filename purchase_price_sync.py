@@ -1,29 +1,33 @@
 #!/usr/bin/env python3
 """
-Purchase-Price Sync — v1.4 Etappe 1 (Tommi 2026-04-16).
+Excel Entry-Price Sync — v1.4 Rollback (Tommi 2026-04-17).
 
-Liest die währungs-spezifischen Purchase-Spalten aus extra_data (stammen aus
-Excel BF–BM Spalten, gesynct von sync_final.py) und schreibt sie in Tommi's
-user_entry_prices Rows. Per (User, Company).
+HISTORIE:
+  v1.4 Etappe 1 (16.04.): Excel Purchase_* → user_entry_prices.purchase_price
+                          → löste Portfolio-Modus im Basket aus (Einstand/Perf%).
+  v1.4 Rollback  (17.04.): Tommi's Feedback — Basket soll REIN Selektion/Buy-Zone
+                          sein. Excel Purchase_* sind laut Tommi = Entry-Preise
+                          (Wunsch-Kaufkurse, nicht Einstandspreise).
+                          Einstand/Performance kommt später in /portfolio.
 
-Geschäftsregeln (per Tommi's Antworten zum v1.4-Plan):
-  - Frage 1 Option A: Jede Purchase-Spalte = Kauf in Währung je Handelsplatz
-  - Frage 2: Purchase_2_$ = veraltet, IGNORIEREN
-  - Frage 3a: Wähle die Spalte passend zur Company-Handelsplatz-Währung
-  - Frage 4 Option B: Nur Tommi pflegt Purchase (Tommi's user_id hardcoded)
-  - Frage 5 Option A: Purchase + Entry getrennte Felder
-  - Purchased_Amount: laut Tommi "momentan nicht berücksichtigen"
+Was dieses Script jetzt tut:
+  • Liest Excel Purchase_*-Spalten aus company.extra_data
+  • Schreibt Wert in user_entry_prices.entry_price (NICHT mehr purchase_price)
+  • Setzt entry_source='excel' auf neu angelegten/aktualisierten Zeilen
+  • ÜBERSCHREIBT NIEMALS Zeilen mit entry_source='manual' (User-UI-Edits)
+  • Alle 2h via morning_sync. User behält UI-Kontrolle.
 
-Verhalten:
-  - Wenn Excel-Purchase-Wert vorhanden (> 0, non-whitespace) → upsert in user_entry_prices
-  - Wenn Excel-Zelle leer/0/whitespace → NICHT löschen (könnte Tommi's manuellen
-    Edit nicht überschreiben; Purchase bleibt bis explizit gecleared)
-  - Dubletten nicht möglich (UNIQUE user_id × company_id)
+Konflikt-Regel (Kern):
+  entry_source='manual'  → Excel-Sync skipt diese Zeile komplett
+  entry_source='excel' oder NULL → Excel-Sync darf upsert machen
+
+User bekommt im UI einen "Zurück auf Excel-Wert"-Button (später umsetzbar),
+falls er einen manuellen Entry wieder auf Excel tracken lassen will.
 
 Usage:
   python3 purchase_price_sync.py            # dry-run (preview only)
   python3 purchase_price_sync.py --apply    # write to Supabase
-  python3 purchase_price_sync.py --verbose  # print per-company details
+  python3 purchase_price_sync.py --verbose  # per-company Details
 """
 
 import argparse
@@ -38,11 +42,12 @@ load_dotenv(os.path.join(SCRIPT_DIR, '.env'))
 
 import supabase_helper
 
-# Tommi's user_id — er pflegt das Excel, ihm gehören die Purchase-Preise
+# Tommi's user_id — er pflegt das Excel, ihm gehören die Entry-Preise aus Excel
 TOMMI_USER_ID = '092aac8f-b80d-4de3-b091-e35a908df11b'
 
 # Mapping: Excel-Spalten-Name → ISO-Währungscode.
 # Purchase_2_$ und Purchased_Amount werden bewusst NICHT gelistet (veraltet/irrelevant).
+# Reihenfolge = Priorität bei Mehrfach-Füllung (USD zuerst, dann EUR, ...).
 CURRENCY_COLUMN_MAP = {
     'Purchase_$':        'USD',
     'Purchase_€':        'EUR',
@@ -54,51 +59,14 @@ CURRENCY_COLUMN_MAP = {
     'Purchase_Korea':    'KRW',
 }
 
-# Fallback-Mapping von Länder-Code auf Default-Währung (Symbolic,
-# falls extra_data.Currency nicht gesetzt). Hält Parität zu src/lib/buy-zone.ts.
-EUR_COUNTRIES = {'DE', 'AT', 'FR', 'IT', 'ES', 'NL', 'BE', 'IE', 'FI', 'PT', 'GR', 'LU'}
-
-
-def default_currency_for_country(country: str) -> str:
-    if not country:
-        return 'USD'
-    c = country.strip().upper()
-    if c in EUR_COUNTRIES:
-        return 'EUR'
-    if c == 'CH':
-        return 'CHF'
-    if c in ('GB', 'UK'):
-        return 'GBP'
-    if c == 'CN':
-        return 'CNY'
-    if c == 'JP':
-        return 'JPY'
-    if c == 'HK':
-        return 'HKD'
-    if c == 'AU':
-        return 'AUD'
-    if c in ('KR', 'KOR'):
-        return 'KRW'
-    return 'USD'
-
-
-def determine_expected_currency(company: dict) -> str:
-    """Bestimme die Währung, in der der Kurs dieser Company erwartet wird."""
-    extra = company.get('extra_data') or {}
-    currency = (extra.get('Currency') or '').strip().upper()
-    if currency:
-        return currency
-    return default_currency_for_country(company.get('country') or '')
-
 
 def parse_purchase_value(raw) -> float | None:
-    """Parse ein Zell-Value zu einem positiven Float, oder None wenn ungültig/leer."""
+    """Parse ein Zell-Value zu positivem Float, oder None wenn ungültig/leer."""
     if raw is None:
         return None
     s = str(raw).strip()
     if not s:
         return None
-    # Excel oft mit Komma statt Punkt
     s = s.replace(',', '.').replace(' ', '')
     try:
         v = float(s)
@@ -109,22 +77,12 @@ def parse_purchase_value(raw) -> float | None:
     return v
 
 
-def extract_purchase_price(company: dict) -> tuple:
+def extract_entry_price(company: dict) -> tuple:
     """
     Returns (price, currency, source_column, other_filled_columns).
 
-    Per Tommi Frage 1 Option A: Jede Purchase-Spalte = ein Kauf in der
-    Spalten-Währung. Pro Firma **normalerweise nur eine Spalte** gefüllt.
-    Wir trusten Tommis Excel-Eintrag: die Spalte, in der er den Wert
-    eingetragen hat, bestimmt die Währung — unabhängig von extra_data.Currency
-    (das kommt von yfinance und kann vom Handelsplatz abweichen; Tommi
-    denkt aber in der Währung in der er tatsächlich gekauft hat).
-
-    Wenn MEHRERE Spalten gefüllt sind → erste non-empty (Insertion-Order
-    der CURRENCY_COLUMN_MAP, praktisch: USD zuerst, dann EUR, dann andere)
-    UND log die anderen als Warning.
-
-    Ignoriert immer Purchase_2_$ und Purchased_Amount (per Tommi veraltet).
+    Priorität = Insertion-Order der CURRENCY_COLUMN_MAP. Wenn mehrere
+    Purchase-Spalten gefüllt sind, wird die erste genommen + Warning.
     """
     extra = company.get('extra_data') or {}
 
@@ -139,25 +97,22 @@ def extract_purchase_price(company: dict) -> tuple:
     if not filled:
         return None, None, None, []
 
-    # Erste Spalte (Insertion-Order) = primary; Rest als Warning zurückgeben
     primary_col, primary_curr, primary_price = filled[0]
     others = [(c, cu, p) for (c, cu, p) in filled[1:]]
     return primary_price, primary_curr, primary_col, others
 
 
 def load_companies(client) -> list:
-    """Lädt alle companies mit extra_data. Wir filtern dann lokal auf die mit Purchase-Spalten."""
     return supabase_helper.get_all_companies(
         'id, name, symbol, country, extra_data'
     )
 
 
 def load_existing_entries(client) -> dict:
-    """Lädt bestehende user_entry_prices für Tommi.
-    Returns {company_id: {entry_price, entry_currency, purchase_price, purchase_currency}}"""
+    """Lädt bestehende user_entry_prices für Tommi (mit entry_source)."""
     try:
         resp = client.table('user_entry_prices') \
-            .select('company_id, entry_price, entry_currency, purchase_price, purchase_currency') \
+            .select('company_id, entry_price, entry_currency, entry_source') \
             .eq('user_id', TOMMI_USER_ID) \
             .execute()
         return {row['company_id']: row for row in (resp.data or [])}
@@ -167,15 +122,17 @@ def load_existing_entries(client) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Sync Tommi Excel Purchase-Preise zu user_entry_prices')
+    parser = argparse.ArgumentParser(description='Sync Tommi Excel Purchase-Preise → user_entry_prices.entry_price')
     parser.add_argument('--apply', action='store_true', help='Write to Supabase')
     parser.add_argument('--verbose', action='store_true', help='Print per-company decisions')
     args = parser.parse_args()
 
     print("\n" + "=" * 70)
-    print("  PURCHASE PRICE SYNC")
+    print("  EXCEL ENTRY-PRICE SYNC  (v1.4 Rollback)")
     print(f"  Mode: {'APPLY' if args.apply else 'DRY-RUN (preview only)'}")
     print(f"  Target user: Tommi ({TOMMI_USER_ID[:8]}…)")
+    print(f"  Regel: Excel Purchase_* → entry_price (source='excel')")
+    print(f"         Manuelle UI-Edits (source='manual') werden NIE überschrieben")
     print("=" * 70)
 
     client = supabase_helper.get_client()
@@ -189,21 +146,21 @@ def main():
     print(f"  Found {len(existing)} existing rows for Tommi")
 
     stats = Counter()
-    updates = []       # new or changed purchase_price
-    unchanged = 0      # Excel value same as DB
+    updates = []
+    unchanged = 0
+    skipped_manual = []   # rows where user has manual override (we skip)
     source_cols = Counter()
-    multi_filled = []  # companies with multiple Purchase-* columns filled (unusual)
+    multi_filled = []
 
     for c in companies:
         extra = c.get('extra_data') or {}
 
-        # Skip companies without ANY Purchase-Spalte
         has_any_purchase_col = any(col in extra for col in CURRENCY_COLUMN_MAP.keys())
         if not has_any_purchase_col:
             stats['no_purchase_columns'] += 1
             continue
 
-        price, currency, source, others = extract_purchase_price(c)
+        price, currency, source, others = extract_entry_price(c)
 
         if price is None:
             stats['no_purchase_value'] += 1
@@ -220,14 +177,23 @@ def main():
         source_cols[source] += 1
 
         existing_row = existing.get(c['id'])
-        if existing_row:
-            existing_price = existing_row.get('purchase_price')
-            existing_curr = existing_row.get('purchase_currency')
-            # Supabase NUMERIC wird manchmal als String zurückgegeben
+
+        # KERN-REGEL: Manual Overrides bleiben unberührt
+        if existing_row and existing_row.get('entry_source') == 'manual':
+            skipped_manual.append({
+                'name': c.get('name'),
+                'excel_price': f'{currency} {price}',
+                'manual_price': f"{existing_row.get('entry_currency')} {existing_row.get('entry_price')}",
+            })
+            stats['skipped_manual_override'] += 1
+            continue
+
+        if existing_row and existing_row.get('entry_price') is not None:
             try:
-                existing_price_f = float(existing_price) if existing_price is not None else None
+                existing_price_f = float(existing_row['entry_price'])
             except (ValueError, TypeError):
                 existing_price_f = None
+            existing_curr = existing_row.get('entry_currency')
             if existing_price_f == price and existing_curr == currency:
                 unchanged += 1
                 continue
@@ -247,8 +213,8 @@ def main():
     # Report
     print(f"\n  Stats:")
     for key, count in sorted(stats.items(), key=lambda x: -x[1]):
-        print(f"    {key:30s}: {count:5d}")
-    print(f"    {'unchanged (already synced)':30s}: {unchanged:5d}")
+        print(f"    {key:32s}: {count:5d}")
+    print(f"    {'unchanged (already synced)':32s}: {unchanged:5d}")
 
     if source_cols:
         print(f"\n  Source-Spalten-Verteilung:")
@@ -256,12 +222,19 @@ def main():
             print(f"    {col:22s}: {count:5d}")
 
     if multi_filled:
-        print(f"\n  ⚠  Datenqualität-Hinweis an Tommi: mehrere Purchase-Spalten gefüllt.")
-        print(f"     Blackfire nimmt die erste (Insertion-Order USD/EUR/GBP/…). Bitte prüfen:")
-        for f in multi_filled[:10]:
-            print(f"    {f['name'][:35]:35s}  primary: {f['primary']}  andere: {', '.join(f['others'])}")
-        if len(multi_filled) > 10:
-            print(f"    ... + {len(multi_filled) - 10} weitere")
+        print(f"\n  ⚠  Datenqualität: mehrere Purchase-Spalten gefüllt ({len(multi_filled)} Firmen)")
+        print(f"     Genommen wird jeweils die erste (USD/EUR/GBP/...).")
+        for f in multi_filled[:5]:
+            print(f"    {f['name'][:35]:35s}  → {f['primary']}  ignoriert: {', '.join(f['others'])}")
+        if len(multi_filled) > 5:
+            print(f"    ... + {len(multi_filled) - 5} weitere")
+
+    if skipped_manual:
+        print(f"\n  🔒 Manuell gesetzt (skipped, {len(skipped_manual)}):")
+        for s in skipped_manual[:10]:
+            print(f"    {s['name'][:35]:35s}  Excel: {s['excel_price']}   Manual: {s['manual_price']}")
+        if len(skipped_manual) > 10:
+            print(f"    ... + {len(skipped_manual) - 10} weitere")
 
     print(f"\n  Updates to apply: {len(updates)}")
     if updates and args.verbose:
@@ -280,10 +253,10 @@ def main():
                     {
                         'user_id': TOMMI_USER_ID,
                         'company_id': u['company_id'],
-                        'purchase_price': u['price'],
-                        'purchase_currency': u['currency'],
-                        'purchase_imported_at': now_iso,
-                        # entry_price / entry_currency bleiben wie sie sind (nicht überschreiben)
+                        'entry_price': u['price'],
+                        'entry_currency': u['currency'],
+                        'entry_set_at': now_iso,
+                        'entry_source': 'excel',
                     },
                     on_conflict='user_id,company_id',
                 ).execute()

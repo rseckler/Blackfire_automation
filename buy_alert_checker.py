@@ -58,16 +58,15 @@ def default_currency_for_country(country: str) -> str:
 
 
 def load_entry_prices(client) -> list:
-    """Load user_entry_prices rows for WATCHLIST-phase companies only.
+    """Load user_entry_prices rows for alle Firmen mit Entry-Preis.
 
-    Per Tommi-Regel (v1.4 Frage 9): Buy-Zone only für Firmen die noch nicht
-    gekauft wurden — also purchase_price IS NULL. Portfolio-Firmen (mit
-    gesetztem purchase_price) sind für Stop-Loss/Stop-Win via sell_alert_checker.
+    v1.4 Rollback (2026-04-17): Portfolio-Modus aus Basket entfernt. Buy-Zone
+    gilt jetzt für ALLE Entry-Preise (egal Excel- oder manual-source). Stop-Loss/
+    Stop-Win kommt später in /portfolio für real gekaufte Firmen (Etappe 2).
     """
     try:
         resp = client.table('user_entry_prices') \
             .select('user_id, company_id, entry_price, entry_currency, entry_set_at') \
-            .is_('purchase_price', 'null') \
             .not_.is_('entry_price', 'null') \
             .execute()
         return resp.data or []
