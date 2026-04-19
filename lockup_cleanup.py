@@ -85,13 +85,42 @@ def oldest_price_year(client, company_id: str) -> int | None:
         if not rows:
             return None
         d = rows[0]['price_date']
-        # Supabase gibt ISO-String
         return int(str(d)[:4])
     except Exception:
         return None
 
 
-def classify_event(ev: dict, company: dict, oldest_year: int | None) -> tuple[str, str]:
+# yfinance-Listing-Date-Cache (einmalig pro Run)
+_yf_cache = {}
+
+
+def yfinance_first_listing_year(symbol: str | None) -> int | None:
+    """Frag yfinance nach dem Listing-Datum. firstTradeDateMilliseconds = Epoch."""
+    if not symbol:
+        return None
+    if symbol in _yf_cache:
+        return _yf_cache[symbol]
+    try:
+        import yfinance as yf
+        t = yf.Ticker(symbol)
+        info = t.info or {}
+        ms = info.get('firstTradeDateMilliseconds') or info.get('firstTradeDateEpochUtc')
+        if not ms:
+            _yf_cache[symbol] = None
+            return None
+        # Wenn Sekunden (Epoch UTC), konvertieren
+        if ms < 10_000_000_000:  # kleiner als ~2286 → Sekunden, nicht ms
+            ms *= 1000
+        from datetime import datetime as _dt
+        year = _dt.utcfromtimestamp(ms / 1000).year
+        _yf_cache[symbol] = year
+        return year
+    except Exception:
+        _yf_cache[symbol] = None
+        return None
+
+
+def classify_event(ev: dict, company: dict, oldest_year: int | None, yf_year: int | None) -> tuple[str, str]:
     """
     Returns (action, reason):
       - 'delete' : sicher löschen
@@ -117,16 +146,26 @@ def classify_event(ev: dict, company: dict, oldest_year: int | None) -> tuple[st
         except (ValueError, TypeError):
             pass
 
-    # Regel 1: Firma hat historische Kurse seit >= 2 Jahren, IPO-Datum aber jünger
-    # → ipo_auto_calc hat "erstes Datum in Excel" fälschlich als IPO-Tag interpretiert.
+    # Regel 1a: yfinance-Listing-Date (harter Primärcheck)
     if (
         source == 'ipo_auto_calc'
-        and oldest_year is not None
+        and yf_year is not None
         and ipo_year is not None
-        and (ipo_year - oldest_year) >= 2  # Kurs-Historie deutlich älter als angeblicher IPO
+        and (ipo_year - yf_year) >= 2  # yfinance sagt: Firma gelistet lange vor angegebenem IPO
     ):
         return ('delete',
-                f'Auto-calc IPO={ipo_year}, aber Kurse seit {oldest_year} → IPO-Datum falsch')
+                f'Auto-calc IPO={ipo_year}, yfinance-Listing seit {yf_year} → IPO-Datum falsch')
+
+    # Regel 1b: stock_prices-basierter Check (fallback wenn yfinance nicht verfügbar)
+    if (
+        source == 'ipo_auto_calc'
+        and yf_year is None  # nur greifen wenn yfinance nichts lieferte
+        and oldest_year is not None
+        and ipo_year is not None
+        and (ipo_year - oldest_year) >= 2
+    ):
+        return ('delete',
+                f'Auto-calc IPO={ipo_year}, Kurse seit {oldest_year} → IPO-Datum falsch')
 
     # Regel 2: Auto-calc ohne S-1-Verifikation bei Firmen die sehr alt aussehen
     # (manuelle Prüfung, nicht automatisch löschen)
@@ -178,8 +217,9 @@ def main():
             continue
         company = companies[cid]
         oldest_year = oldest_price_year(client, cid)
+        yf_year = yfinance_first_listing_year(company.get('symbol'))
 
-        action, reason = classify_event(ev, company, oldest_year)
+        action, reason = classify_event(ev, company, oldest_year, yf_year)
         if action == 'delete':
             to_delete.append((ev, reason))
             stats['delete'] += 1
