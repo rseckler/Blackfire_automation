@@ -99,6 +99,15 @@ def classify_event(ev: dict, company: dict, oldest_year: int | None) -> tuple[st
       - 'keep'   : OK lassen
     """
     meta = ev.get('event_metadata') or {}
+    # Supabase gibt JSONB manchmal als String zurück → parsen
+    if isinstance(meta, str):
+        try:
+            import json as _json
+            meta = _json.loads(meta)
+        except Exception:
+            meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
     source = meta.get('source') or ''
     ipo_date_str = meta.get('ipo_date')
     ipo_year = None
