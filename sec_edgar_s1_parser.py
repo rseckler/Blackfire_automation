@@ -56,8 +56,11 @@ SEC_SUBMISSIONS_URL = 'https://data.sec.gov/submissions/CIK{cik:010d}.json'
 SEC_FULL_TEXT_SEARCH = 'https://efts.sec.gov/LATEST/search-index?q={q}&ciks={cik:010d}&forms={forms}'
 SEC_ARCHIVE_URL = 'https://www.sec.gov/Archives/edgar/data/{cik}/{accession_nodash}/{doc}'
 
-# Filing types to inspect (in priority order)
-LOCKUP_FILING_TYPES = ['S-1/A', 'S-1', '424B4', '424B1', '424B3', '10-K']
+# Filing types to inspect. Priority-Order: S-1-Varianten enthalten Lockup
+# sehr zuverlässig, 424B-Varianten der finale Prospekt. 10-K/424B3 bewusst
+# ausgeschlossen — die enthalten typischerweise keinen Lockup-Abschnitt
+# und sorgen nur für falsche-Positiv-Haiku-Calls.
+LOCKUP_FILING_TYPES = ['S-1/A', 'S-1', '424B4', '424B1']
 
 # Test-Set aus PLAN-LOCKUP-SYSTEM-v1.md Abschnitt 8
 TEST_SET_SYMBOLS = [
@@ -103,14 +106,16 @@ def fetch_submissions(cik: int) -> dict | None:
 
 
 def find_recent_lockup_filings(submissions: dict) -> list:
-    """Durchsuche submissions.json nach relevanten Filing-Types."""
+    """Durchsuche submissions.json nach S-1/424B-Filings (inkl. older files-Archive)."""
     out = []
-    recent = submissions.get('filings', {}).get('recent', {}) if submissions else {}
+    filings = submissions.get('filings', {}) if submissions else {}
+
+    # 1. Recent (letzte ~1000 Filings)
+    recent = filings.get('recent', {})
     forms = recent.get('form', [])
     dates = recent.get('filingDate', [])
     accession_numbers = recent.get('accessionNumber', [])
     primary_docs = recent.get('primaryDocument', [])
-
     for i, form in enumerate(forms):
         if form in LOCKUP_FILING_TYPES:
             out.append({
@@ -119,6 +124,34 @@ def find_recent_lockup_filings(submissions: dict) -> list:
                 'accession_number': accession_numbers[i],
                 'primary_document': primary_docs[i],
             })
+
+    # 2. Ältere Filings aus files[] (für Firmen die schon 10+ Jahre gelistet sind)
+    if not out:
+        for archive in filings.get('files', []):
+            url = f"https://data.sec.gov/submissions/{archive.get('name')}"
+            try:
+                r = requests.get(url, headers=sec_headers(), timeout=30)
+                if r.status_code != 200:
+                    continue
+                arch_data = r.json()
+                af = arch_data.get('form', [])
+                ad = arch_data.get('filingDate', [])
+                aa = arch_data.get('accessionNumber', [])
+                ap = arch_data.get('primaryDocument', [])
+                for i, form in enumerate(af):
+                    if form in LOCKUP_FILING_TYPES:
+                        out.append({
+                            'form': form,
+                            'filing_date': ad[i],
+                            'accession_number': aa[i],
+                            'primary_document': ap[i],
+                        })
+                time.sleep(0.15)  # rate-limit
+                if out:
+                    break  # one archive with hits reicht
+            except Exception:
+                continue
+
     return out
 
 
@@ -148,12 +181,16 @@ def fetch_filing_text(cik: int, filing: dict) -> str | None:
         return None
 
 
-# Regex für Lockup-Abschnitte
+# Regex für Lockup-Abschnitte (erweitert für bessere Coverage)
 LOCKUP_PATTERNS = [
     re.compile(r'lock[-\s]?up\s+agreement', re.IGNORECASE),
     re.compile(r'lock[-\s]?up\s+period', re.IGNORECASE),
-    re.compile(r'180[-\s]?day\s+lock[-\s]?up', re.IGNORECASE),
+    re.compile(r'\b\d{2,3}[-\s]?day\s+lock[-\s]?up', re.IGNORECASE),
     re.compile(r'lock[-\s]?up\s+restrictions?', re.IGNORECASE),
+    re.compile(r'lock[-\s]?up\s+provisions?', re.IGNORECASE),
+    re.compile(r'lock[-\s]?up\s+expir', re.IGNORECASE),
+    re.compile(r'subject\s+to\s+(a\s+)?lock[-\s]?up', re.IGNORECASE),
+    re.compile(r'without\s+the\s+prior\s+written\s+consent.*lock[-\s]?up', re.IGNORECASE),
 ]
 
 
@@ -206,7 +243,7 @@ Wenn keine Lockup-Informationen gefunden werden: {{"found": false, ...}}."""
 
     try:
         resp = client.messages.create(
-            model='claude-haiku-4-5-20251022',
+            model='claude-haiku-4-5-20251001',
             max_tokens=1024,
             messages=[{'role': 'user', 'content': prompt}],
         )
