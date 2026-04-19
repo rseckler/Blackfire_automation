@@ -221,25 +221,56 @@ def haiku_extract(blocks: list[str], company_name: str, filing_meta: dict) -> di
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
     joined_blocks = "\n\n---\n\n".join(blocks)
 
-    prompt = f"""Du bist ein Finanz-Prospekt-Analyst. Extrahiere Lock-up-Details aus den folgenden Textblöcken aus einem SEC-Filing der Firma "{company_name}" (Filing-Typ: {filing_meta.get('form')}, Datum: {filing_meta.get('filing_date')}).
+    prompt = f"""Du bist ein Finanz-Prospekt-Analyst. Dein Auftrag ist präzise Extraktion des PRIMÄR-Lockups aus dem S-1/424B-Prospekt.
+
+FIRMA: "{company_name}"
+FILING: {filing_meta.get('form')} vom {filing_meta.get('filing_date')}
+
+WICHTIG — Unterscheide diese Lockup-Typen:
+
+1. PRIMÄR-Lockup (der interessante):
+   - Gilt für "directors, executive officers and holders of substantially all of our outstanding common stock"
+   - Typische Dauer: 90, 180 oder 365 Tage
+   - Betrifft in der Regel 60-95% aller ausstehenden Aktien
+   - DAS ist was wir wollen.
+
+2. Sponsor-Lockup (bei SPACs, NICHT der primäre):
+   - Nur für den SPAC-Sponsor / Founders-Aktien
+   - Oft 3-7 Jahre (1095-2555 Tage)
+   - Betrifft nur Founder-Shares, kleiner Anteil
+   - Falls nur Sponsor-Lockup vorhanden: found=false eintragen (nicht verwechseln!)
+
+3. Earn-out / Performance-Lockups:
+   - Aktien die erst bei Kurs-Triggern (+30%) freiwerden
+   - Nicht der Primär-Lockup, ignorieren
+
+REGELN:
+- Wenn mehrere Lockup-Typen erwähnt: extrahiere NUR den Primär-Lockup
+- Wenn Sponsor-Lockup mit Jahreszahl (z.B. "3-year lockup") als EINZIGER Lockup: return found=false
+- shares_total muss in Stück stehen (z.B. 50000000 für 50 Millionen)
+- Fordere shares_total nur ein wenn wörtlich im Text genannt (z.B. "aggregate of X shares")
+- lockup_days als Zahl, keine Beschreibung
 
 TEXTBLÖCKE:
 {joined_blocks[:15000]}
 
-Antworte AUSSCHLIESSLICH mit einem JSON-Objekt mit folgenden Feldern:
+Antworte AUSSCHLIESSLICH mit diesem JSON:
 {{
   "found": true/false,
-  "lockup_days": Zahl (z.B. 180) oder null,
-  "shares_total": Zahl der Aktien im Lockup oder null,
-  "effective_date": "YYYY-MM-DD" des IPO-Prospekts oder null,
-  "tranches": [{{"days": 180, "shares": 50000000, "note": "..."}}] (falls mehrere Tranchen) oder [],
+  "is_primary_lockup": true/false (false wenn nur Sponsor- oder Performance-Lockup gefunden),
+  "lockup_type": "insider" | "sponsor" | "performance" | "mixed",
+  "lockup_days": Zahl oder null,
+  "shares_total": Zahl oder null,
+  "shares_citation": "wörtliches Zitat mit Zahl aus Prospekt" oder null,
+  "effective_date": "YYYY-MM-DD" des Prospekts oder null,
+  "tranches": [{{"days": 180, "shares": 50000000, "note": "Beschreibung"}}] oder [],
   "insider_filer_relationships": ["directors", "officers", "10% holders"] oder [],
-  "release_events": ["earnings release", ...] (Events, die den Lockup früher beenden können) oder [],
-  "confidence": "high" | "medium" | "low",
-  "summary": "Ein-Satz-Zusammenfassung (max 150 Zeichen)"
+  "release_events": ["quarterly earnings", ...] oder [],
+  "confidence": {{"days": "high"|"medium"|"low", "shares": "high"|"medium"|"low"}},
+  "summary": "Ein Satz max 150 Zeichen"
 }}
 
-Wenn keine Lockup-Informationen gefunden werden: {{"found": false, ...}}."""
+Wenn kein Primär-Lockup gefunden: {{"found": false, ...}}."""
 
     try:
         resp = client.messages.create(
@@ -298,6 +329,9 @@ def process_symbol(
     # Prio: S-1/A > S-1 > 424B4 ...
     filings.sort(key=lambda f: LOCKUP_FILING_TYPES.index(f['form']))
 
+    # Track wenn wir sponsor-only-Lockups gesehen haben (für besseren Fehlermode)
+    seen_sponsor_only = False
+
     # 4) Bis zu 2 Filings durchgehen, beim ersten Treffer stoppen
     for filing in filings[:2]:
         if verbose:
@@ -325,6 +359,13 @@ def process_symbol(
                 print(f"    Haiku: no lockup found in blocks")
             continue
 
+        # Reject: NUR Sponsor-/Performance-Lockup gefunden (nicht primary)
+        if extracted.get('is_primary_lockup') is False:
+            if verbose:
+                print(f"    Haiku: only {extracted.get('lockup_type')}-Lockup found, skipping")
+            seen_sponsor_only = True
+            continue
+
         # Erfolg!
         status['stage'] = 'extracted'
         status['result'] = {
@@ -342,8 +383,12 @@ def process_symbol(
 
         return status
 
-    status['stage'] = 'no_lockup_found'
-    status['error'] = f'Checked {min(2, len(filings))} filings, no lockup extracted'
+    if seen_sponsor_only:
+        status['stage'] = 'only_sponsor_lockup'
+        status['error'] = 'Nur Sponsor-/Performance-Lockup — kein Primary-Insider-Lockup gefunden'
+    else:
+        status['stage'] = 'no_lockup_found'
+        status['error'] = f'Checked {min(2, len(filings))} filings, no lockup extracted'
     return status
 
 
@@ -369,12 +414,23 @@ def save_to_db(db_client, symbol: str, result: dict):
         print(f"    WARN: Could not compute event_date: {e}")
         return
 
+    # Confidence-Struktur v2: per-Feld (days/shares)
+    conf = ex.get('confidence') or {}
+    if isinstance(conf, str):  # Alt-Format Kompat
+        conf = {'days': conf, 'shares': conf}
+    days_conf = conf.get('days') or 'low'
+
     metadata = {
         'source': 'sec_edgar_s1',
-        'confidence': 'verified' if ex.get('confidence') in ('high', 'medium') else 'estimated',
+        'confidence': 'verified' if days_conf in ('high', 'medium') else 'estimated',
+        'confidence_detail': conf,
+        'lockup_type': ex.get('lockup_type') or 'insider',
         'lockup_days': ex.get('lockup_days'),
         'share_count': ex.get('shares_total'),
         'share_count_source': 'sec_edgar_s1',
+        'shares_citation': ex.get('shares_citation'),
+        'insider_relationships': ex.get('insider_filer_relationships') or [],
+        'release_events': ex.get('release_events') or [],
         'ipo_date': ex.get('effective_date'),
         'filing_form': result['filing_form'],
         'filing_accession': result['accession'],
@@ -471,8 +527,14 @@ def main():
             days = ex.get('lockup_days')
             shares = ex.get('shares_total')
             days_str = f"{days}d" if days else "—"
-            shares_str = f"{shares:,} shares" if shares else "— shares"
-            print(f"    ✓ Lockup gefunden: {days_str}, {shares_str}, conf={ex.get('confidence')}")
+            shares_str = f"{shares:,}" if shares else "—"
+            conf = ex.get('confidence')
+            if isinstance(conf, dict):
+                conf_str = f"days={conf.get('days', '?')}/shares={conf.get('shares', '?')}"
+            else:
+                conf_str = str(conf)
+            lt = ex.get('lockup_type', '?')
+            print(f"    ✓ {lt}-Lockup: {days_str}, {shares_str} shares  [{conf_str}]")
             stats['success'] += 1
         else:
             print(f"    ✗ {status['stage']}: {status['error']}")
