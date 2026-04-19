@@ -468,7 +468,11 @@ def main():
 
         if status['result']:
             ex = status['result']['extracted']
-            print(f"    ✓ Lockup gefunden: {ex.get('lockup_days')}d, {ex.get('shares_total')} shares, conf={ex.get('confidence')}")
+            days = ex.get('lockup_days')
+            shares = ex.get('shares_total')
+            days_str = f"{days}d" if days else "—"
+            shares_str = f"{shares:,} shares" if shares else "— shares"
+            print(f"    ✓ Lockup gefunden: {days_str}, {shares_str}, conf={ex.get('confidence')}")
             stats['success'] += 1
         else:
             print(f"    ✗ {status['stage']}: {status['error']}")
