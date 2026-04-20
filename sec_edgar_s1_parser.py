@@ -445,8 +445,12 @@ def save_to_db(db_client, symbol: str, result: dict):
         # Haupt-Event für Tranche 1
         for idx, tranche in enumerate(tranches, start=1):
             try:
-                t_days = tranche.get('days', ex.get('lockup_days', 180))
-                t_date = base_date + timedelta(days=t_days)
+                # Fallback-Kette: tranche.days > ex.lockup_days > 180. dict.get() gibt
+                # None zurück wenn Key mit None-Wert existiert — deshalb "or" verwenden.
+                t_days = tranche.get('days') or ex.get('lockup_days') or 180
+                if not isinstance(t_days, (int, float)):
+                    t_days = 180
+                t_date = base_date + timedelta(days=int(t_days))
                 t_meta = {**metadata, 'tranche': idx, 'tranche_total': len(tranches),
                           'share_count': tranche.get('shares') or ex.get('shares_total'),
                           'notes': tranche.get('note') or ex.get('summary')}
